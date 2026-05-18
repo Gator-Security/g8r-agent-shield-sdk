@@ -1,6 +1,10 @@
-import type { Config } from 'jest';
-
-const config: Config = {
+/**
+ * Jest config — plain CommonJS so it parses with no `ts-node` dependency.
+ * Test files are still TypeScript; `ts-jest` transpiles them (see `transform`).
+ *
+ * @type {import('jest').Config}
+ */
+const config = {
   testEnvironment: 'node',
   transform: {
     '^.+\\.ts$': ['ts-jest', { tsconfig: './tsconfig.json' }],
@@ -17,4 +21,4 @@ const config: Config = {
   },
 };
 
-export default config;
+module.exports = config;
