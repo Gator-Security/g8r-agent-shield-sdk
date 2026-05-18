@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build / packaging artifacts
+dist/
+build/
+*.egg-info/
+*.tsbuildinfo
+
+# Caches
+.turbo/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+coverage/
+
+# Python virtualenvs
+.venv/
+venv/
+
+# Environment / secrets
+.env*
+
+# OS / editor
+.DS_Store
+.vscode/
