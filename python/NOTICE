@@ -1,0 +1,22 @@
+G8R Agent Shield
+Copyright (c) 2026 Gator Security
+
+This product is licensed under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance with the
+License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This NOTICE file applies to the open-source components of G8R Agent
+Shield distributed under the Apache License, Version 2.0 — specifically
+the TypeScript SDK (`@g8r/agent-shield-sdk` on npm) and the Python SDK
+(`g8r-shield` on PyPI).
+
+The G8R Agent Shield console image (`agent-shield-console`) is NOT
+distributed under this License; it is distributed under a separate
+proprietary commercial agreement. See the EULA shipped with the image
+or contact Gator Security for terms.
+
+Per Apache License §4(d), any derivative works of the open-source
+components distributed by third parties must include a readable copy of
+this NOTICE file.
