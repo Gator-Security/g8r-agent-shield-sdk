@@ -11,11 +11,12 @@ This is a **TypeScript source package** — no compile step. Consumers reference
 ## Quick Start
 
 ```typescript
-import { AgentShield } from '@g8r-security/agent-shield-sdk';
+import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   consoleUrl: 'https://shield.yourcompany.com',
   apiKey: 'sk-shield-...',
+  tenantId: tenantId('acme-corp'),
   agentId: 'enterprise-assistant',
   department: 'Finance',
   userId: 'usr_FIN_042',
