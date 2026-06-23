@@ -2,7 +2,7 @@
  * G8R Agent Shield SDK
  *
  * Lightweight TypeScript client that wraps LLM calls with policy enforcement.
- * Automatically intercepts prompts, applies local-first VPC redaction (local-first),
+ * Automatically intercepts prompts, applies best-effort local-first redaction,
  * checks them against the G8R policy engine, and logs all activity to the
  * Agent Shield Console.
  *
@@ -79,7 +79,7 @@ export interface PolicyCheckResult {
   /**
    * Tokens that were redacted from the prompt before it reached the gateway.
    * Undefined when no tokens were redacted (clean prompt).
-   * Populated by the local-first VPC local-first redaction layer.
+   * Populated by the local-first redaction layer.
    */
   redactedTokens?: string[];
 }
@@ -100,9 +100,10 @@ export class AgentShield {
   /**
    * Check a prompt against the policy engine before sending to the LLM.
    *
-   * Applies local-first VPC redaction (local-first) before sending to the gateway,
-   * ensuring signing keys, custodial IDs, and high-entropy secrets never leave
-   * the local process in plaintext.
+   * Applies best-effort local-first redaction before sending to the gateway, so
+   * recognized signing keys, custodial IDs, common PII, and high-entropy secrets
+   * are stripped before the prompt leaves the process. Redaction is one layer of
+   * defense, not a guarantee that every secret is caught (see redaction.ts).
    *
    * Returns the policy decision without executing the LLM call.
    */
@@ -110,8 +111,8 @@ export class AgentShield {
     prompt: string,
     requestId: RequestId = newRequestId()
   ): Promise<PolicyCheckResult> {
-    // Step 1: Local-first redaction — strip signing keys and custodial IDs
-    // before the prompt reaches the remote gateway (local-first VPC masking).
+    // Step 1: Local-first redaction — strip recognized secrets and PII
+    // before the prompt reaches the remote gateway.
     const { redacted, tokensReplaced } = redactSensitiveData(prompt);
 
     // `requestId` is generated per-call by default, but `wrap()` passes its
@@ -183,7 +184,8 @@ export class AgentShield {
     // Step 1: Check the prompt against the policy engine (includes redaction)
     const policyResult = await this.check(prompt, requestId);
 
-    // Step 2: Log the attempt regardless of decision
+    // Step 2: Log the attempt regardless of decision. log() redacts before
+    // transmitting, so the audit-log path never leaks raw secrets either.
     await this.log(prompt, policyResult, requestId);
 
     // Step 3: Enforce the decision. Exhaustive match — adding a fourth
@@ -214,6 +216,9 @@ export class AgentShield {
 
   /**
    * Log an interaction to the Agent Shield Console.
+   *
+   * Redacts the prompt before transmitting: the audit trail must not store or
+   * carry raw secrets/PII, and this is an egress point just like /check.
    */
   private async log(
     input: string,
@@ -225,6 +230,9 @@ export class AgentShield {
       request_id: requestId,
     });
 
+    // Redact at the egress boundary — never send the raw prompt to /log.
+    const { redacted } = redactSensitiveData(input);
+
     const res = await fetch(`${this.config.consoleUrl}/api/sdk/v1/log`, {
       method: 'POST',
       headers: {
@@ -232,7 +240,7 @@ export class AgentShield {
         Authorization: `Bearer ${this.config.apiKey}`,
       },
       body: JSON.stringify({
-        input,
+        input: redacted,
         tenantId: this.config.tenantId,
         requestId,
         userId: this.config.userId,
