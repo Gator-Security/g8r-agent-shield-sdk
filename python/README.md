@@ -2,7 +2,7 @@
 
 Lightweight Python SDK for wrapping LLM calls with enterprise-grade policy enforcement.
 
-Mirrors the TypeScript SDK [`@g8r/agent-shield-sdk`](https://www.npmjs.com/package/@g8r/agent-shield-sdk). Same wire contract, same semantics, idiomatic Python surface.
+Mirrors the TypeScript SDK [`@g8r-security/agent-shield-sdk`](https://www.npmjs.com/package/@g8r-security/agent-shield-sdk). Same wire contract, same semantics, idiomatic Python surface.
 
 ## Installation
 

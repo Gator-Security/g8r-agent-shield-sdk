@@ -6,7 +6,7 @@
  * `request_id` so downstream pipelines can route audit trails per-tenant.
  *
  * Vendored into the SDK (a verbatim copy of the engine's logger) so the
- * published `@g8r/agent-shield-sdk` package carries no `@g8r/core`
+ * published `@g8r-security/agent-shield-sdk` package carries no `@g8r-security/core`
  * dependency — the engine is private IP and must not be a public-package
  * dependency.
  *
