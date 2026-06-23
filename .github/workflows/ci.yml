@@ -21,6 +21,24 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  consumer-smoke-test:
+    name: Consumer smoke test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+      # Packs the SDK, installs the tarball into a throwaway project, and
+      # verifies the public API type-checks + redaction fires — i.e. exactly
+      # what a customer experiences. Catches missing exports, broken `exports`
+      # maps, raw-TS publishing, and leaked internal references before release.
+      - run: npm run smoke-test
+
   python:
     name: Python SDK
     runs-on: ubuntu-latest
