@@ -7,7 +7,7 @@
  * Agent Shield Console.
  *
  * Usage:
- *   import { AgentShield } from '@g8r/agent-shield-sdk';
+ *   import { AgentShield } from '@g8r-security/agent-shield-sdk';
  *
  *   const shield = new AgentShield({
  *     consoleUrl: 'https://shield.yourcompany.com',

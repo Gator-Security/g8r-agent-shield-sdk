@@ -8,7 +8,7 @@ This repository holds two SDKs that maintain a deliberate surface parity:
 
 | SDK        | Path                     | Package                          |
 | ---------- | ------------------------ | -------------------------------- |
-| TypeScript | [`js/`](./js)            | `@g8r/agent-shield-sdk` (npm)    |
+| TypeScript | [`js/`](./js)            | `@g8r-security/agent-shield-sdk` (npm)    |
 | Python     | [`python/`](./python)    | `g8r-shield` (PyPI)              |
 
 ## What it does
@@ -26,7 +26,7 @@ Every `check()` / `wrap()` call:
 ### TypeScript
 
 ```ts
-import { AgentShield } from '@g8r/agent-shield-sdk';
+import { AgentShield } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   consoleUrl: 'https://shield.yourcompany.com',
