@@ -1,4 +1,4 @@
-# @g8r/agent-shield-sdk
+# @g8r-security/agent-shield-sdk
 
 TypeScript client SDK for integrating AI agents with G8R policy enforcement. Includes a **local VPC redaction layer** that strips sensitive data before it ever leaves your network.
 
@@ -11,7 +11,7 @@ This is a **TypeScript source package** — no compile step. Consumers reference
 ## Quick Start
 
 ```typescript
-import { AgentShield } from '@g8r/agent-shield-sdk';
+import { AgentShield } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   consoleUrl: 'https://shield.yourcompany.com',
@@ -70,7 +70,7 @@ const result = await shield.check(prompt);
 Standalone redaction — can be used independently of the shield client.
 
 ```typescript
-import { redactSensitiveData } from '@g8r/agent-shield-sdk';
+import { redactSensitiveData } from '@g8r-security/agent-shield-sdk';
 
 const { redacted, tokensReplaced } = redactSensitiveData(input);
 ```
