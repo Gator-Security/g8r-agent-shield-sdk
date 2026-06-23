@@ -4,7 +4,7 @@ import { tenantId } from '../src/ids';
 const mockConfig = {
   consoleUrl: 'http://localhost:3000',
   apiKey: 'sk-shield-test-key',
-  tenantId: tenantId('bitgo-inc'),
+  tenantId: tenantId('acme-inc'),
   department: 'Engineering',
   userId: 'usr_ENG_001',
   aiModel: 'GPT-4o',
@@ -302,6 +302,22 @@ describe('AgentShield', () => {
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
         'http://localhost:3000/api/sdk/v1/log'
       );
+    });
+
+    it('sends a REDACTED prompt to /log (audit path must not leak raw secrets)', async () => {
+      mockFetchSequence([
+        { ok: true, body: allowedResponse },
+        { ok: true, body: { id: 'log-entry' } },
+      ]);
+
+      await shield.wrap(
+        () => Promise.resolve('ok'),
+        'Move funds from custodial-id:abc123xyz now'
+      );
+
+      const logBody = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
+      expect(logBody.input).toContain('[REDACTED:CUSTODIAL_ID]');
+      expect(logBody.input).not.toContain('custodial-id:abc123xyz');
     });
 
     it('sends employeeName in log request (defaults to userId)', async () => {
