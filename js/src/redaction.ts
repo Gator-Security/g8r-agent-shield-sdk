@@ -1,12 +1,19 @@
 /**
- * BitGo VPC Sensitive Data Redaction
+ * Local-First Sensitive Data Redaction
  *
- * Redacts cryptographic keys, custodial identifiers, and high-entropy strings
- * BEFORE sending prompts to the G8R policy gateway (local-first redaction layer).
+ * Best-effort redaction of common secret and PII formats BEFORE prompts reach
+ * the policy gateway. Covers cryptographic key formats, custodial identifiers,
+ * high-entropy strings, and common PII (card numbers validated via Luhn, US
+ * SSNs, email addresses, and phone numbers).
  *
- * Compliance:
- *   - GDPR Art. 32: Security of Processing — appropriate technical measures
- *   - PCI-DSS 3.4: Render PAN/sensitive data unreadable wherever stored or transmitted
+ * IMPORTANT — this is a defense-in-depth layer, NOT a guarantee of completeness.
+ * Pattern- and entropy-based redaction cannot catch every secret or PII shape
+ * (e.g. unstructured PII, names, novel token formats, or values below the
+ * entropy threshold). Do not rely on it as a sole control; keep downstream
+ * safeguards and human review in place.
+ *
+ * It helps *support* (does not by itself satisfy) controls such as GDPR Art. 32
+ * and PCI-DSS PAN-handling by reducing sensitive-data exposure to the gateway.
  */
 
 export interface RedactionResult {
@@ -57,7 +64,7 @@ const PEM_PATTERN =
 
 // ── Custodial ID Patterns ─────────────────────────────────────────────────────
 
-/** BitGo custodial-id format: `custodial-id:abc123xyz` */
+/** Custodial-id format: `custodial-id:abc123xyz` */
 const CUSTODIAL_ID_PATTERN = /\bcustodial-id:[A-Za-z0-9_-]+\b/g;
 
 /** Short custodial references: `cust-98765` */
@@ -68,6 +75,46 @@ const WALLET_ID_PATTERN = /\bwallet-id:[A-Za-z0-9_-]+\b/g;
 
 /** Vault identifiers: `vault-id:v-secure-001` */
 const VAULT_ID_PATTERN = /\bvault-id:[A-Za-z0-9_-]+\b/g;
+
+// ── PII Patterns (best-effort) ────────────────────────────────────────────────
+
+/** Email addresses. */
+const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
+/** US Social Security Numbers in dashed or spaced form, e.g. `123-45-6789`. */
+const SSN_PATTERN = /\b\d{3}[ -]\d{2}[ -]\d{4}\b/g;
+
+/**
+ * Phone numbers with explicit separators (avoids matching arbitrary digit runs).
+ * Optional country code, then 3-3-4 with space/dot/hyphen between groups.
+ */
+const PHONE_PATTERN = /\b(?:\+?\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}\b/g;
+
+/**
+ * Candidate card-number runs: 13–19 digits with optional single space/hyphen
+ * separators. Validated with Luhn before redacting to avoid false positives on
+ * arbitrary long numbers (order/invoice IDs, etc.).
+ */
+const CARD_CANDIDATE_PATTERN = /\b\d(?:[ -]?\d){12,18}\b/g;
+
+/**
+ * Luhn checksum — used to gate card-number redaction so we only mask digit runs
+ * that actually pass the check digit, not every long number.
+ */
+function luhnValid(digits: string): boolean {
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i--) {
+    let d = digits.charCodeAt(i) - 48;
+    if (double) {
+      d *= 2;
+      if (d > 9) d -= 9;
+    }
+    sum += d;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
 
 // ── Entropy Detection Constants ───────────────────────────────────────────────
 
@@ -97,7 +144,8 @@ function extractHighEntropyTokens(input: string): string[] {
  * 3. WIF private keys
  * 4. Raw hex 256-bit keys
  * 5. Custodial IDs (all four variants)
- * 6. High-entropy string catch-all
+ * 6. PII — card numbers (Luhn-validated), SSNs, emails, phone numbers
+ * 7. High-entropy string catch-all
  */
 export function redactSensitiveData(input: string): RedactionResult {
   const tokensReplaced: string[] = [];
@@ -118,6 +166,20 @@ export function redactSensitiveData(input: string): RedactionResult {
   replaceAll(CUST_PATTERN, 'CUST_ID');
   replaceAll(WALLET_ID_PATTERN, 'WALLET_ID');
   replaceAll(VAULT_ID_PATTERN, 'VAULT_ID');
+
+  // PII (best-effort). Card numbers first, gated by Luhn so we don't mask every
+  // long digit run; then structured SSN / email / phone formats.
+  redacted = redacted.replace(CARD_CANDIDATE_PATTERN, (match) => {
+    const digits = match.replace(/\D/g, '');
+    if (digits.length >= 13 && digits.length <= 19 && luhnValid(digits)) {
+      tokensReplaced.push(match);
+      return '[REDACTED:CARD]';
+    }
+    return match;
+  });
+  replaceAll(SSN_PATTERN, 'SSN');
+  replaceAll(EMAIL_PATTERN, 'EMAIL');
+  replaceAll(PHONE_PATTERN, 'PHONE');
 
   // High-entropy catch-all — runs on the already-redacted string to avoid double-replacing.
   const highEntropyTokens = extractHighEntropyTokens(redacted);

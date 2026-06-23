@@ -2,7 +2,7 @@ import { tenantId, newRequestId } from '../src/ids';
 
 describe('tenantId', () => {
   it('accepts a valid slug', () => {
-    expect(tenantId('bitgo-inc')).toBe('bitgo-inc');
+    expect(tenantId('acme-inc')).toBe('acme-inc');
   });
 
   it('rejects the empty string', () => {

@@ -76,27 +76,32 @@ import { redactSensitiveData } from '@g8r-security/agent-shield-sdk';
 const { redacted, tokensReplaced } = redactSensitiveData(input);
 ```
 
-## VPC Redaction Layer
+## Redaction Layer
 
-Sensitive data is detected and replaced **locally** before leaving the VPC. The gateway never sees raw secrets.
+Sensitive data is detected and replaced **locally** before the prompt leaves the process — on both the policy-check and audit-log paths, so the gateway never receives recognized raw secrets.
+
+> ⚠️ **Best-effort, not exhaustive.** Redaction is pattern- and entropy-based. It catches the formats listed below, but it **cannot** catch every secret or PII shape — unstructured PII (names, addresses), free-form secrets below the entropy threshold, or novel token formats may pass through. Treat this as one layer of defense-in-depth, not a compliance guarantee, and keep downstream controls and human review in place.
 
 ### Detection Patterns
 
-| Pattern | Label | Maps to |
-|---|---|---|
-| BIP-32 extended keys (`xpub`, `xprv`, `ypub`, …) | `[REDACTED:BIP32_KEY]` | PCI-DSS 3.4 |
-| WIF private keys (Base58, starts with `5`, `K`, or `L`) | `[REDACTED:WIF_KEY]` | PCI-DSS 3.4 |
-| 256-bit hex keys (64 hex chars, optional `0x` prefix) | `[REDACTED:HEX_KEY]` | PCI-DSS 3.4, GDPR Art. 32 |
-| PEM private / public key blocks | `[REDACTED:PEM_KEY]` | GDPR Art. 32 |
-| `custodial-id:…` | `[REDACTED:CUSTODIAL_ID]` | GDPR Art. 32 |
-| `cust-{digits}` | `[REDACTED:CUST_ID]` | GDPR Art. 32 |
-| `wallet-id:…` | `[REDACTED:WALLET_ID]` | GDPR Art. 32 |
-| `vault-id:…` | `[REDACTED:VAULT_ID]` | GDPR Art. 32 |
-| High Shannon entropy strings (≥4.5 bits/char, ≥32 chars) | `[REDACTED:HIGH_ENTROPY]` | GDPR Art. 32, PCI-DSS 3.4 |
+| Pattern | Label |
+|---|---|
+| BIP-32 extended keys (`xpub`, `xprv`, `ypub`, …) | `[REDACTED:BIP32_KEY]` |
+| WIF private keys (Base58, starts with `5`, `K`, or `L`) | `[REDACTED:WIF_KEY]` |
+| 256-bit hex keys (64 hex chars, optional `0x` prefix) | `[REDACTED:HEX_KEY]` |
+| PEM private / public key blocks | `[REDACTED:PEM_KEY]` |
+| `custodial-id:…` / `cust-{digits}` / `wallet-id:…` / `vault-id:…` | `[REDACTED:CUSTODIAL_ID]` etc. |
+| Card numbers (13–19 digits, Luhn-validated) | `[REDACTED:CARD]` |
+| US SSNs (`123-45-6789`) | `[REDACTED:SSN]` |
+| Email addresses | `[REDACTED:EMAIL]` |
+| Phone numbers (separated, e.g. `415-555-0199`) | `[REDACTED:PHONE]` |
+| High Shannon entropy strings (≥4.5 bits/char, ≥32 chars) | `[REDACTED:HIGH_ENTROPY]` |
+
+These map to controls such as **GDPR Art. 32** (security of processing) and **PCI-DSS** PAN handling by reducing sensitive-data exposure — they *support* those controls rather than satisfy them on their own.
 
 ### Shannon Entropy Detection
 
-Any token that is 32+ characters with Shannon entropy ≥ 4.5 bits/char is caught as a generic high-entropy secret. This acts as a catch-all for API keys, tokens, and other secrets that don't match a known format.
+Any token that is 32+ characters with Shannon entropy ≥ 4.5 bits/char is caught as a generic high-entropy secret. This is a best-effort catch for many API keys and tokens that don't match a known format — but secrets shorter than 32 chars or below the entropy threshold will not be caught.
 
 ```
 H = -Σ p(c) × log₂(p(c))   for each unique character c

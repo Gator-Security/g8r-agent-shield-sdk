@@ -5,10 +5,8 @@
  * for governance contexts where each log line must carry `tenant_id` and
  * `request_id` so downstream pipelines can route audit trails per-tenant.
  *
- * Vendored into the SDK (a verbatim copy of the engine's logger) so the
- * published `@g8r-security/agent-shield-sdk` package carries no `@g8r-security/core`
- * dependency — the engine is private IP and must not be a public-package
- * dependency.
+ * Self-contained in the SDK so the published `@g8r-security/agent-shield-sdk`
+ * package has no dependency on internal packages.
  *
  * Use the default `log` singleton for app-level chatter; call `createLogger`
  * (or `.child()`) when you need per-request bindings injected.

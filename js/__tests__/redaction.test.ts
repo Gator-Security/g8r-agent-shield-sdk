@@ -151,6 +151,51 @@ describe('redactSensitiveData', () => {
     });
   });
 
+  describe('PII patterns', () => {
+    it('redacts a Luhn-valid credit card number (spaced)', () => {
+      const { redacted, tokensReplaced } = redactSensitiveData('card 4111 1111 1111 1111 on file');
+      expect(redacted).toContain('[REDACTED:CARD]');
+      expect(redacted).not.toContain('4111 1111 1111 1111');
+      expect(tokensReplaced).toContain('4111 1111 1111 1111');
+    });
+
+    it('redacts a Luhn-valid credit card number (contiguous)', () => {
+      const { redacted } = redactSensitiveData('pan 4111111111111111');
+      expect(redacted).toContain('[REDACTED:CARD]');
+    });
+
+    it('does NOT redact a long digit run that fails Luhn (e.g. order id)', () => {
+      // 16 digits but an invalid card checksum (valid 4111…1111 with last digit bumped)
+      const { redacted, tokensReplaced } = redactSensitiveData('order 4111111111111112 shipped');
+      // Fails Luhn → left intact, not masked as CARD
+      expect(redacted).not.toContain('[REDACTED:CARD]');
+      expect(tokensReplaced).not.toContain('4111111111111112');
+    });
+
+    it('redacts a US SSN', () => {
+      const { redacted, tokensReplaced } = redactSensitiveData('ssn 123-45-6789');
+      expect(redacted).toContain('[REDACTED:SSN]');
+      expect(tokensReplaced).toContain('123-45-6789');
+    });
+
+    it('redacts an email address', () => {
+      const { redacted } = redactSensitiveData('contact john.doe@acme.com please');
+      expect(redacted).toContain('[REDACTED:EMAIL]');
+      expect(redacted).not.toContain('john.doe@acme.com');
+    });
+
+    it('redacts a separated phone number', () => {
+      const { redacted } = redactSensitiveData('call 415-555-0199 today');
+      expect(redacted).toContain('[REDACTED:PHONE]');
+      expect(redacted).not.toContain('415-555-0199');
+    });
+
+    it('leaves clean prose untouched', () => {
+      const { tokensReplaced } = redactSensitiveData('Please summarize the Q1 report.');
+      expect(tokensReplaced).toHaveLength(0);
+    });
+  });
+
   describe('Shannon entropy detection', () => {
     it('redacts high-entropy string of 32+ chars', () => {
       // A Base64-encoded random string will have entropy well above 4.5 bits/char

@@ -15,10 +15,12 @@ This repository holds two SDKs that maintain a deliberate surface parity:
 
 Every `check()` / `wrap()` call:
 
-1. Redacts signing keys, custodial IDs, and high-entropy secrets from the
-   prompt **before** it leaves the process (local-first redaction).
+1. Redacts recognized signing keys, custodial IDs, common PII (card numbers,
+   SSNs, emails, phone numbers), and high-entropy secrets from the prompt
+   **before** it leaves the process (best-effort, local-first redaction — see
+   the caveat below). The same redaction is applied to the audit-log payload.
 2. Evaluates the prompt against your deployed G8R Console's policy engine.
-3. Records the interaction in the audit trail.
+3. Records the (redacted) interaction in the audit trail.
 4. Blocks, escalates, or allows the action per the policy decision.
 
 ## Quick start
