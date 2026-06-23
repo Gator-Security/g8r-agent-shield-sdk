@@ -26,12 +26,12 @@ Every `check()` / `wrap()` call:
 ### TypeScript
 
 ```ts
-import { AgentShield } from '@g8r-security/agent-shield-sdk';
+import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   consoleUrl: 'https://shield.yourcompany.com',
   apiKey: 'sk-shield-...',
-  tenantId: 'your-tenant',
+  tenantId: tenantId('your-tenant'),
   department: 'Finance',
   userId: 'usr_001',
   aiModel: 'gpt-4o',

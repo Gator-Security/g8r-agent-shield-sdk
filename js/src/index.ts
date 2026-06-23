@@ -7,11 +7,12 @@
  * Agent Shield Console.
  *
  * Usage:
- *   import { AgentShield } from '@g8r-security/agent-shield-sdk';
+ *   import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
  *
  *   const shield = new AgentShield({
  *     consoleUrl: 'https://shield.yourcompany.com',
  *     apiKey: 'sk-shield-...',
+ *     tenantId: tenantId('acme-corp'),
  *     department: 'Finance',
  *     userId: 'usr_FIN_042',
  *     aiModel: 'GPT-4o',
@@ -31,6 +32,14 @@ import { match } from 'ts-pattern';
 import { newRequestId, type RequestId, type TenantId } from './ids';
 import { log } from './logger';
 import { redactSensitiveData } from './redaction';
+
+// ── Public API re-exports ────────────────────────────────────────────────────
+// Consumers need `tenantId()` to construct the branded TenantId required by
+// ShieldConfig, and `redactSensitiveData` is documented as a public helper.
+export { tenantId, newRequestId } from './ids';
+export type { TenantId, RequestId } from './ids';
+export { redactSensitiveData } from './redaction';
+export type { RedactionResult } from './redaction';
 
 export interface ShieldConfig {
   /** URL of the G8R Agent Shield Console */
