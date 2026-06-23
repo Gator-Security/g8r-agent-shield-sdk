@@ -2,7 +2,7 @@
  * Branded id types + constructors used by the SDK.
  *
  * Vendored from the engine's `types.ts` so the published
- * `@g8r/agent-shield-sdk` package carries no `@g8r/core` dependency — the
+ * `@g8r-security/agent-shield-sdk` package carries no `@g8r-security/core` dependency — the
  * engine is private IP and must not be a public-package dependency. Only
  * the id types/helpers the SDK actually uses are copied here.
  */
