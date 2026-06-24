@@ -93,7 +93,9 @@ must("crypto key", "key xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPP
 
 echo "==> Asserting no internal references leaked into the published bundle"
 PKG_DIR="$WORK/node_modules/@g8r-security/agent-shield-sdk"
-if grep -riE 'local-first|private ip|vendored' "$PKG_DIR/dist" "$PKG_DIR/README.md"; then
+# Sentinels for internal/confidential leftovers. Deliberately does not hardcode
+# partner names — those should never be in the source in the first place.
+if grep -riE 'private ip|vendored|internal[- ]only' "$PKG_DIR/dist" "$PKG_DIR/README.md"; then
   echo "    FAIL: internal reference found in published artifact"
   exit 1
 fi
