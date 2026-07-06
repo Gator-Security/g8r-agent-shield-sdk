@@ -4,12 +4,17 @@ Client SDKs for **G8R Agent Shield** — an enterprise AI-governance control
 plane. Wrap your LLM and agent calls with deterministic policy enforcement,
 local-first sensitive-data redaction, and a tamper-evident audit trail.
 
-This repository holds two SDKs that maintain a deliberate surface parity:
+This repository holds two SDKs with an aligned wire contract and semantics:
 
 | SDK        | Path                     | Package                          |
 | ---------- | ------------------------ | -------------------------------- |
 | TypeScript | [`js/`](./js)            | `@g8r-security/agent-shield-sdk` (npm)    |
 | Python     | [`python/`](./python)    | `g8r-shield` (PyPI)              |
+
+> **Note:** Full TS/Python constructor-surface parity is a tracked goal, not yet
+> complete. The surfaces differ today — the TypeScript `ShieldConfig` requires
+> `department`, `userId`, and `aiModel`, while the Python constructor defaults
+> them. The wire contract and pipeline semantics are aligned across both.
 
 ## What it does
 

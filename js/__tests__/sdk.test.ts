@@ -227,7 +227,7 @@ describe('AgentShield', () => {
       const killSwitchResponse = {
         decision: 'blocked',
         reason: 'Partner compensation data is restricted',
-        violatedRule: 'Unauthorized Partner Data Access',
+        violatedRule: 'Sensitive Data Egress',
         requiresApproval: false,
         sessionRevoked: true,
         complianceMappings: [
@@ -252,7 +252,7 @@ describe('AgentShield', () => {
         expect(err).toBeInstanceOf(ShieldBlockedError);
         const blocked = err as ShieldBlockedError;
         expect(blocked.sessionRevoked).toBe(true);
-        expect(blocked.violatedRule).toBe('Unauthorized Partner Data Access');
+        expect(blocked.violatedRule).toBe('Sensitive Data Egress');
       }
     });
 
@@ -349,7 +349,7 @@ describe('AgentShield', () => {
       expect(logBody.employeeName).toBe('Alex Park');
     });
 
-    it('C2: wrap() uses a single requestId for both /check and /log', async () => {
+    it('wrap() uses a single requestId for both /check and /log', async () => {
       mockFetchSequence([
         { ok: true, body: allowedResponse },
         { ok: true, body: { id: 'log-entry' } },

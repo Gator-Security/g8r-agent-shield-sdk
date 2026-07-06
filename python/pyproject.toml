@@ -65,11 +65,11 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Gator-Security/g8r-agent-shield"
-Repository = "https://github.com/Gator-Security/g8r-agent-shield"
-Documentation = "https://github.com/Gator-Security/g8r-agent-shield/blob/main/python-sdk/README.md"
-Issues = "https://github.com/Gator-Security/g8r-agent-shield/issues"
-Changelog = "https://github.com/Gator-Security/g8r-agent-shield/releases"
+Homepage = "https://github.com/Gator-Security/g8r-agent-shield-sdk"
+Repository = "https://github.com/Gator-Security/g8r-agent-shield-sdk"
+Documentation = "https://github.com/Gator-Security/g8r-agent-shield-sdk/blob/main/python/README.md"
+Issues = "https://github.com/Gator-Security/g8r-agent-shield-sdk/issues"
+Changelog = "https://github.com/Gator-Security/g8r-agent-shield-sdk/releases"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -256,8 +256,9 @@ class AgentShield:
         """
         # Generate a single request_id for this wrap() invocation and thread
         # it through both _evaluate and _log so the two server-side log lines
-        # can be joined end-to-end (C2). Without this, each internal call
-        # mints its own uuid4 and the policy→action linkage is lost.
+        # can be joined end-to-end under a single correlation id. Without this,
+        # each internal call mints its own uuid4 and the policy→action linkage
+        # is lost.
         request_id = str(uuid.uuid4())
 
         decision = self._evaluate(prompt, request_id=request_id)
@@ -295,7 +296,7 @@ class AgentShield:
 
     def _evaluate(self, prompt: str, request_id: str | None = None) -> PolicyDecision:
         # `request_id` is generated per-call by default. `wrap()` passes its
-        # own value so /check and /log share a single correlation id (C2).
+        # own value so /check and /log share a single correlation id.
         if request_id is None:
             request_id = str(uuid.uuid4())
         # Local-first redaction (local-first VPC layer): strip signing keys,
@@ -398,7 +399,7 @@ class AgentShield:
         never break the user's LLM call or mask the decision path.
 
         ``request_id`` is generated per-call by default. ``wrap()`` passes
-        its own value so /check and /log share a single correlation id (C2).
+        its own value so /check and /log share a single correlation id.
         """
         if request_id is None:
             request_id = str(uuid.uuid4())

@@ -163,7 +163,7 @@ class TestCheck:
 
         assert decision.decision == "blocked"
         assert decision.session_revoked is True
-        assert decision.violated_rule == "Unauthorized Partner Data Access"
+        assert decision.violated_rule == "Sensitive Data Egress"
 
     @responses.activate
     def test_logs_by_default(self, shield):
@@ -619,8 +619,8 @@ class TestPayloadShape:
     def test_outbound_payload_includes_tenant_and_request_id(self, shield):
         """Both /check and /log payloads must carry tenantId and a UUID requestId.
 
-        Closes governance gap G1: every outbound request from the SDK is
-        attributable to a tenant and traceable via request_id end-to-end.
+        Ensures every outbound request from the SDK is attributable to a
+        tenant and traceable via request_id end-to-end.
         """
         import uuid as _uuid
 
@@ -648,7 +648,7 @@ class TestPayloadShape:
 
     @responses.activate
     def test_c2_wrap_uses_single_request_id_for_check_and_log(self, shield):
-        """C2: wrap() emits the same request_id to /check and /log.
+        """wrap() emits the same request_id to /check and /log.
 
         End-to-end correlation requires that a single shield.wrap() invocation
         produces ONE request_id, threaded through both the policy evaluation

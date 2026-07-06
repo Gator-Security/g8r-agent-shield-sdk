@@ -6,7 +6,13 @@ Part of the [G8R Agent Shield monorepo](../../README.md).
 
 ## Overview
 
-This is a **TypeScript source package** — no compile step. Consumers reference `./src/index.ts` directly via `transpilePackages` (Next.js) or `resolve.alias` (Vite).
+This is a **compiled package**, built with [tsup](https://tsup.egg.js.org/). Publishing ships the `dist/` output — ESM (`dist/index.mjs`), CommonJS (`dist/index.js`), and type declarations (`dist/index.d.ts`) — and `package.json` sets `"files": ["dist"]`, so `src/` is **not** included in the published tarball. Consumers import from the package name:
+
+```typescript
+import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
+```
+
+No `transpilePackages` / `resolve.alias` wiring is needed — the package resolves through its standard `main` / `module` / `types` / `exports` entry points.
 
 ## Quick Start
 
@@ -29,6 +35,8 @@ const result = await shield.wrap(
   userPrompt
 );
 ```
+
+> **`ShieldConfig` required fields.** `consoleUrl`, `apiKey`, `tenantId`, `department`, `userId`, and `aiModel` are all required. Only `agentId` (defaults to `"sdk-client"`) and `employeeName` (defaults to `userId`) are optional. Omitting any required field is a TypeScript compile error.
 
 ## API
 
@@ -136,17 +144,48 @@ class ShieldBlockedError extends Error {
 }
 ```
 
+## `ShieldLogEntry`
+
+Returned by the internal audit-log call when logging succeeds.
+
+```typescript
+interface ShieldLogEntry {
+  id: string;        // audit-trail entry id
+  decision: string;  // recorded decision
+  timestamp: string; // ISO 8601 timestamp
+}
+```
+
+## Request IDs
+
+The SDK correlates each `check()`/`log()` pair with a per-request id so the two
+server-side log lines can be joined. `wrap()` generates one automatically, but
+the id type and constructor are exported for callers who want to supply or
+propagate their own.
+
+```typescript
+import { newRequestId, type RequestId } from '@g8r-security/agent-shield-sdk';
+
+const requestId: RequestId = newRequestId();
+const result = await shield.check(prompt, requestId);
+```
+
+- `newRequestId(): RequestId` — mints a fresh id (prefers `crypto.randomUUID()`).
+- `RequestId` — branded string type for a per-request correlation id.
+
 ## Source Layout
 
 ```
-packages/sdk/
+js/
 ├── src/
-│   ├── index.ts       # AgentShield class, ShieldBlockedError, PolicyCheckResult
-│   └── redaction.ts   # redactSensitiveData() — VPC masking layer
+│   ├── index.ts       # AgentShield class, ShieldBlockedError, PolicyCheckResult, ShieldLogEntry
+│   ├── redaction.ts   # redactSensitiveData() — local-first masking layer
+│   ├── ids.ts         # tenantId(), newRequestId() + TenantId / RequestId types
+│   └── logger.ts      # structured logger used internally
 ├── __tests__/
-│   ├── sdk.test.ts        # 43 tests — SDK client behavior + redaction integration
-│   └── redaction.test.ts  # 43 tests — all patterns + entropy detection
-├── jest.config.ts
+│   ├── sdk.test.ts        # SDK client behavior + redaction integration
+│   └── redaction.test.ts  # all patterns + entropy detection
+├── jest.config.js
 ├── package.json
 └── tsconfig.json
 ```
@@ -154,16 +193,17 @@ packages/sdk/
 ## Development
 
 ```bash
-cd packages/sdk
+cd js
 
-npm test               # Jest (43 tests)
-npm run test:coverage  # With coverage (97%+ statements)
+npm run build          # tsup — build dist/ (ESM + CJS + types)
+npm test               # Jest
+npm run test:coverage  # With coverage
 npm run typecheck      # tsc --noEmit
 ```
 
 ## Coverage
 
-Thresholds in `jest.config.ts`: 85% statements, 75% branches, 85% functions, 85% lines.
+Thresholds in `jest.config.js`: 85% statements, 75% branches, 85% functions, 85% lines.
 
 ## Compliance
 

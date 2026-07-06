@@ -95,7 +95,7 @@ def kill_switch_response() -> dict:
     return {
         "decision": "blocked",
         "reason": "Partner compensation data is restricted.",
-        "violatedRule": "Unauthorized Partner Data Access",
+        "violatedRule": "Sensitive Data Egress",
         "requiresApproval": False,
         "sessionRevoked": True,
         "complianceMappings": [

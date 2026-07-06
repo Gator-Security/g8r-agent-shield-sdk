@@ -8,6 +8,7 @@ Usage:
     from g8r_shield import AgentShield, ShieldBlockedError
 
     shield = AgentShield(
+        tenant_id="demo-tenant",
         console_url="https://your-console.railway.app",
         api_key="sk-shield-your-key",
         department="Legal",
@@ -34,8 +35,8 @@ import structlog
 from ._version import __version__
 
 # Configure structlog once at module import so consumers get structured JSON
-# log output with timestamp + level out of the box. The G2 governance audit
-# requires explicit, structured context on every operational log line.
+# log output with timestamp + level out of the box. Audit logging requires
+# explicit, structured context on every operational log line.
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso", utc=True),
