@@ -20,13 +20,13 @@ No `transpilePackages` / `resolve.alias` wiring is needed — the package resolv
 import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
-  consoleUrl: 'https://shield.yourcompany.com',
-  apiKey: 'sk-shield-...',
-  tenantId: tenantId('acme-corp'),
-  agentId: 'enterprise-assistant',
-  department: 'Finance',
-  userId: 'usr_FIN_042',
-  aiModel: 'GPT-4o',
+  tenantId: tenantId('acme-corp'),        // the only hard-required field
+  consoleUrl: 'https://shield.yourcompany.com', // or G8R_CONSOLE_URL env var
+  apiKey: 'sk-shield-...',                // or G8R_API_KEY env var
+  agentId: 'enterprise-assistant',        // optional — defaults to 'sdk-client'
+  department: 'Finance',                  // optional — defaults to 'General'
+  userId: 'usr_FIN_042',                  // optional — defaults to 'unknown'
+  aiModel: 'GPT-4o',                      // optional — defaults to 'unknown'
 });
 
 // Factory pattern — LLM is only called if the policy check passes
@@ -36,7 +36,14 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` required fields.** `consoleUrl`, `apiKey`, `tenantId`, `department`, `userId`, and `aiModel` are all required. Only `agentId` (defaults to `"sdk-client"`) and `employeeName` (defaults to `userId`) are optional. Omitting any required field is a TypeScript compile error.
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`).
+
+```typescript
+// Minimal — consoleUrl + apiKey from env, everything else defaulted:
+//   export G8R_CONSOLE_URL=https://shield.yourcompany.com
+//   export G8R_API_KEY=sk-shield-...
+const shield = new AgentShield({ tenantId: tenantId('acme-corp') });
+```
 
 ## API
 
@@ -47,9 +54,9 @@ The primary integration point. Runs the full pipeline:
 1. **Redact** — `redactSensitiveData(prompt)` strips secrets locally
 2. **Check** — POST redacted prompt to `/api/sdk/v1/check` (policy evaluation)
 3. **Log** — POST audit entry to `/api/sdk/v1/log`
-4. **Invoke** — call `factory()` only if decision is `allowed` or `escalated`
+4. **Invoke** — call `factory()` only if decision is `allowed`, or `escalated` while `blockOnEscalated` is `false`
 
-If blocked, throws `ShieldBlockedError` — the factory is **never called**.
+If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` reuses `check(prompt, { requestId, log: false })` and then logs once with the same `requestId`, so `/check` and `/log` correlate under a single id with no duplicate audit entry.
 
 ```typescript
 try {
@@ -64,15 +71,23 @@ try {
 }
 ```
 
-### `shield.check(prompt)`
+### `shield.check(prompt, opts?)`
 
-Policy check only — no LLM call.
+Policy check only — no LLM call. **Never throws** on a `blocked`/`escalated` decision; it returns the decision for the caller to act on. By default it is **self-auditing** — it also POSTs to `/log` with the same `requestId`. Pass `{ log: false }` if you will follow up with `wrap()` for the same prompt (to avoid a duplicate audit entry), and `{ requestId }` to supply your own correlation id.
 
 ```typescript
 const result = await shield.check(prompt);
 // result.decision         → 'allowed' | 'blocked' | 'escalated'
 // result.redactedTokens   → tokens stripped from the prompt before sending
+
+// Options:
+const result2 = await shield.check(prompt, {
+  requestId: newRequestId(), // supply your own correlation id (optional)
+  log: false,                // suppress the built-in audit log (default: true)
+});
 ```
+
+On a non-2xx response, `check()` throws a typed **`ShieldConsoleError`** (its message exposes only the status code — the raw body is on `.detail`). On a transient connection failure it retries once, then throws **`ShieldConnectionError`**.
 
 ### `redactSensitiveData(input)`
 
@@ -131,16 +146,33 @@ interface PolicyCheckResult {
 }
 ```
 
-## `ShieldBlockedError`
-
-Thrown by `shield.wrap()` when `decision === 'blocked'`.
+## Error taxonomy
 
 ```typescript
+// Thrown by wrap() on a 'blocked' decision, or an 'escalated' decision when
+// the shield was constructed with blockOnEscalated: true. The one error a
+// normal caller catches.
 class ShieldBlockedError extends Error {
-  decision: 'blocked';
+  decision: string;                        // 'blocked' | 'escalated'
   reason: string;
   violatedRule: string | null;
   complianceMappings: ComplianceMapping[];
+  sessionRevoked: boolean;                 // true when a kill-switch policy fired
+}
+
+// Thrown on a non-2xx HTTP response from /check. The message exposes ONLY the
+// status code — the raw response body is on `.detail` for opt-in inspection,
+// never in the message (so host frameworks can't echo internal stack
+// traces / auth payloads / PII to end users).
+class ShieldConsoleError extends Error {
+  statusCode: number;
+  detail: string;                          // raw body — opt-in only
+}
+
+// Thrown when the Console is unreachable after the single retry. Names the
+// console URL; carries no response body.
+class ShieldConnectionError extends Error {
+  consoleUrl: string;
 }
 ```
 
@@ -167,7 +199,7 @@ propagate their own.
 import { newRequestId, type RequestId } from '@g8r-security/agent-shield-sdk';
 
 const requestId: RequestId = newRequestId();
-const result = await shield.check(prompt, requestId);
+const result = await shield.check(prompt, { requestId });
 ```
 
 - `newRequestId(): RequestId` — mints a fresh id (prefers `crypto.randomUUID()`).
