@@ -66,8 +66,8 @@ export interface PolicyCheckResult {
   violatedRule: string | null;
   requiresApproval: boolean;
   /**
-   * Set to true when a kill-switch rule fires (e.g. unauthorized partner data
-   * access). Consumers should tear down the agent session in response.
+   * Set to true when a kill-switch policy fires. Consumers should tear down
+   * the agent session in response.
    */
   sessionRevoked?: boolean;
   complianceMappings: Array<{
@@ -116,9 +116,9 @@ export class AgentShield {
     const { redacted, tokensReplaced } = redactSensitiveData(prompt);
 
     // `requestId` is generated per-call by default, but `wrap()` passes its
-    // own value so /check and /log share a single correlation id end-to-end
-    // (C2). Build a scoped logger bound to tenantId + requestId so any
-    // failure path emits lines with that context automatically.
+    // own value so /check and /log share a single correlation id end-to-end.
+    // Build a scoped logger bound to tenantId + requestId so any failure path
+    // emits lines with that context automatically.
     const scopedLog = log.child({
       tenant_id: this.config.tenantId,
       request_id: requestId,
@@ -177,8 +177,8 @@ export class AgentShield {
   async wrap<T>(llmCallFactory: () => Promise<T>, prompt: string): Promise<T> {
     // Generate a single requestId for this wrap() invocation and thread it
     // through both /check and /log so the two server-side log lines can be
-    // joined end-to-end (C2). Without this, each call would mint its own id
-    // and the audit trail would lose the policy→action linkage.
+    // joined end-to-end. Without this, each call would mint its own id and the
+    // audit trail would lose the policy→action linkage.
     const requestId = newRequestId();
 
     // Step 1: Check the prompt against the policy engine (includes redaction)

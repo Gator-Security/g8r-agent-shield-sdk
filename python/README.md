@@ -16,7 +16,7 @@ For the Bedrock example:
 pip install "g8r-shield[bedrock]"
 ```
 
-Requires Python 3.10+. Pairs with a G8R Agent Shield console — see [DEPLOY.md](https://github.com/Gator-Security/g8r-agent-shield/blob/main/DEPLOY.md) for the container.
+Requires Python 3.10+. Pairs with a G8R Agent Shield console. See [RELEASING.md](https://github.com/Gator-Security/g8r-agent-shield-sdk/blob/main/RELEASING.md) for release and packaging details.
 
 ## Quick Start
 
@@ -24,6 +24,7 @@ Requires Python 3.10+. Pairs with a G8R Agent Shield console — see [DEPLOY.md]
 from g8r_shield import AgentShield, ShieldBlockedError
 
 shield = AgentShield(
+    tenant_id="acme-corp",
     console_url="https://shield.yourcompany.com",
     api_key="sk-shield-...",
     department="Finance",
@@ -58,7 +59,7 @@ caller invokes shield.wrap(factory, prompt)
 shield.check(prompt) → POST /api/sdk/v1/check
        |
        v
-Policy Engine evaluates against 14+ rules
+Policy Engine evaluates against your configured policy set
        |
        +--> BLOCKED   → ShieldBlockedError raised (factory never called)
        +--> ESCALATED → Warning emitted, factory invoked
@@ -77,16 +78,20 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 
 ### `AgentShield(...)`
 
-| Parameter       | Type            | Required | Default                                     | Description                              |
-| --------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
-| `console_url`   | `str`           | No       | `G8R_CONSOLE_URL` env, else `localhost:3000` | URL of the G8R Agent Shield Console      |
-| `api_key`       | `str`           | No       | `G8R_API_KEY` env                           | API key for authentication               |
-| `department`    | `str`           | No       | `"General"`                                 | Department of the calling user           |
-| `user_id`       | `str`           | No       | `"unknown"`                                 | User identifier                          |
-| `employee_name` | `str \| None`   | No       | `None` (falls back to `user_id` in logs)    | Display name for audit trail             |
-| `ai_model`      | `str`           | No       | `"unknown"`                                 | AI model being called                    |
-| `agent_id`      | `str`           | No       | `"sdk-client"`                              | Agent identifier (matches TS SDK default) |
-| `timeout`       | `int`           | No       | `10`                                        | HTTP request timeout in seconds          |
+| Parameter            | Type            | Required | Default                                     | Description                              |
+| -------------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
+| `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty |
+| `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback) |
+| `api_key`            | `str`           | Yes\*    | `G8R_API_KEY` env                           | API key for authentication. Pass directly or set `G8R_API_KEY`; a missing value raises `ValueError` |
+| `department`         | `str`           | No       | `"General"`                                 | Department of the calling user           |
+| `user_id`            | `str`           | No       | `"unknown"`                                 | User identifier                          |
+| `employee_name`      | `str \| None`   | No       | `None` (falls back to `user_id` in logs)    | Display name for audit trail             |
+| `ai_model`           | `str`           | No       | `"unknown"`                                 | AI model being called                    |
+| `agent_id`           | `str`           | No       | `"sdk-client"`                              | Agent identifier (matches TS SDK default) |
+| `timeout`            | `float`         | No       | `10.0`                                      | HTTP request timeout in seconds          |
+| `block_on_escalated` | `bool`          | No       | `False`                                     | When `True`, `wrap()` raises `ShieldBlockedError` on escalated decisions instead of proceeding with a warning (fail-closed) |
+
+\* `console_url` and `api_key` may be supplied either as keyword arguments or via the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither source provides a value, the constructor raises `ValueError`.
 
 ### `shield.check(prompt: str) -> PolicyDecision`
 
@@ -111,6 +116,7 @@ Evaluate a prompt and conditionally execute the LLM call. The interaction is log
 | `requires_approval`   | `bool`                     | Whether human approval is required                   |
 | `session_revoked`     | `bool`                     | Whether the agent session was revoked                |
 | `compliance_mappings` | `list[ComplianceMapping]`  | Regulatory controls implicated by the decision       |
+| `redacted_tokens`     | `list[str]`                | Sensitive tokens stripped from the prompt by the local-first redaction layer before it reached the gateway; empty when the prompt was clean |
 
 ### `ShieldBlockedError`
 
@@ -140,6 +146,25 @@ Returned by the internal log call when audit logging succeeds.
 | `id`        | `str`  | Audit-trail entry id                 |
 | `decision`  | `str`  | Recorded decision                    |
 | `timestamp` | `str`  | ISO 8601 timestamp                   |
+
+### `ShieldConsoleError`
+
+Raised when the G8R Console returns a non-2xx HTTP response. Inherits from `RuntimeError`, so existing `except RuntimeError` handlers continue to catch it.
+
+| Property      | Type          | Description                                                              |
+| ------------- | ------------- | ----------------------------------------------------------------------- |
+| `status_code` | `int \| str`  | HTTP status code returned by the Console                                |
+| `detail`      | `str`         | Raw response body, preserved for opt-in inspection; the default `str(exc)` message stays generic and does not leak it |
+
+### `get_logger`
+
+```python
+from g8r_shield import get_logger
+
+log = get_logger(tenant_id="acme-corp")
+```
+
+`get_logger(**bindings) -> structlog.stdlib.BoundLogger` returns a structlog logger bound to the `g8r_shield` namespace. Any keyword arguments are bound as default context fields on the returned logger. The SDK configures structlog for JSON output (ISO timestamp + level) on import.
 
 ## Pre-flight check
 
