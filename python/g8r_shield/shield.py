@@ -110,6 +110,24 @@ class ShieldConsoleError(RuntimeError):
         self.detail = detail
 
 
+class ShieldConnectionError(RuntimeError):
+    """Raised when the G8R Console is unreachable after the single retry.
+
+    Distinguishes "couldn't reach the server" (connection refused, DNS
+    failure, or timeout, even after one retry) from "the server said no"
+    (:class:`ShieldConsoleError`). Callers that want to fail open on a
+    transient network partition but fail closed on an explicit policy
+    rejection can branch on the exception type.
+
+    The message names the ``console_url`` and that a retry was attempted,
+    but — unlike :class:`ShieldConsoleError` — there is no response body to
+    carry, because the request never completed.
+
+    Inherits from :class:`RuntimeError` so existing ``except RuntimeError``
+    catch-alls continue to handle the case without change.
+    """
+
+
 class AgentShield:
     """
     Gate AI agent actions through the G8R policy engine.
@@ -128,8 +146,15 @@ class AgentShield:
     by ``__slots__``); the instance contains no mutable state.
 
     Args:
-        console_url: Base URL of your deployed G8R Console.
-        api_key: Bearer token for the SDK check endpoint.
+        tenant_id: The one hard-required field — identifies the tenant in the
+            multi-tenant plane. Must be a non-empty string. No env fallback:
+            tenant is call-site identity, not deployment config.
+        console_url: Base URL of your deployed G8R Console. Required in effect,
+            but resolved from this argument OR the ``G8R_CONSOLE_URL`` env var;
+            construction fails if neither is set. Never defaults to localhost.
+        api_key: Bearer token for the SDK check/log endpoints. Required in
+            effect, resolved from this argument OR the ``G8R_API_KEY`` env var;
+            construction fails if neither yields a non-empty value.
         department: Functional department (e.g. 'Legal', 'Finance').
         user_id: Identifier of the end-user initiating the action.
         employee_name: Human-readable name for audit trail.
@@ -213,7 +238,13 @@ class AgentShield:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def check(self, prompt: str, log: bool = True) -> PolicyDecision:
+    def check(
+        self,
+        prompt: str,
+        *,
+        request_id: str | None = None,
+        log: bool = True,
+    ) -> PolicyDecision:
         """
         Evaluate a prompt against the policy engine without executing anything.
 
@@ -222,19 +253,31 @@ class AgentShield:
 
         Args:
             prompt: The raw prompt or action string to evaluate.
+            request_id: Explicit correlation id to stamp on this evaluation.
+                When ``None`` (the default), a fresh uuid4 is minted per call.
+                When provided, it is used verbatim on ``/check`` and — if
+                ``log`` is True — the SAME id is threaded to ``/log`` so the
+                policy decision and the audit line join end-to-end. ``wrap()``
+                passes its own id here to correlate the whole invocation.
             log: Whether to record this evaluation in the audit trail. Default
                 True so that direct ``check()`` calls don't create blind spots
                 in the Console audit record. Pass ``log=False`` if you intend
                 to follow up with ``wrap()`` for the same prompt — ``wrap()``
                 logs internally and duplicate entries would result.
 
-        Note: when called as a standalone public method, each internal call
-        (``_evaluate`` and ``_log``) mints its own ``request_id``. Use
-        ``wrap()`` for single-id end-to-end correlation across check and log.
+        Note: when called standalone with ``request_id=None``, each internal
+        call (``_evaluate`` and ``_log``) mints its own id. Pass an explicit
+        ``request_id`` (or use ``wrap()``) for single-id end-to-end
+        correlation across check and log.
         """
-        decision = self._evaluate(prompt)
+        # Mint one id up front (when the caller didn't supply one) so the same
+        # value stamps both /check and /log — otherwise _evaluate and _log each
+        # mint their own and the two server-side lines can't be joined.
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+        decision = self._evaluate(prompt, request_id=request_id)
         if log:
-            self._log(prompt, decision)
+            self._log(prompt, decision, request_id=request_id)
         return decision
 
     def wrap(self, factory: Callable[[], T], prompt: str) -> T:
@@ -255,18 +298,25 @@ class AgentShield:
                 construction time to raise on escalated instead.
         """
         # Generate a single request_id for this wrap() invocation and thread
-        # it through both _evaluate and _log so the two server-side log lines
-        # can be joined end-to-end under a single correlation id. Without this,
-        # each internal call mints its own uuid4 and the policy→action linkage
-        # is lost.
+        # it through both the policy check and the audit log so the two
+        # server-side log lines can be joined end-to-end under a single
+        # correlation id. Without this, each internal call mints its own uuid4
+        # and the policy→action linkage is lost.
         request_id = str(uuid.uuid4())
 
-        decision = self._evaluate(prompt, request_id=request_id)
+        # Reuse the PUBLIC check() path with logging suppressed. Suppressing the
+        # log here (rather than letting check() log) avoids a duplicate audit
+        # entry — wrap() writes exactly one /log line, explicitly, below. This
+        # keeps a single call graph (check → log) for both check() and wrap().
+        decision = self.check(prompt, request_id=request_id, log=False)
 
         # Audit-log the attempt regardless of decision so it appears in the
         # Console audit trail. Done before enforcement so blocked decisions
         # are recorded even if downstream code never sees them.
         self._log(prompt, decision, request_id=request_id)
+
+        if decision.decision == "allowed":
+            return factory()
 
         if decision.decision == "blocked":
             if decision.session_revoked:
@@ -289,8 +339,26 @@ class AgentShield:
                 agent_id=self._agent_id,
                 reason=decision.reason,
             )
+            return factory()
 
-        return factory()
+        # Exhaustive switch: any decision value we don't recognise fails CLOSED
+        # rather than silently proceeding to factory(). Mirrors the TypeScript
+        # SDK's ts-pattern `.exhaustive()`. A future 4th decision value surfaces
+        # here loudly instead of being treated as "allowed" by omission.
+        raise ShieldBlockedError(
+            PolicyDecision(
+                decision=decision.decision,
+                reason=(
+                    f"[G8R Shield] Unrecognised policy decision "
+                    f"{decision.decision!r}; failing closed."
+                ),
+                violated_rule=decision.violated_rule,
+                requires_approval=decision.requires_approval,
+                session_revoked=decision.session_revoked,
+                compliance_mappings=decision.compliance_mappings,
+                redacted_tokens=decision.redacted_tokens,
+            )
+        )
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -317,6 +385,10 @@ class AgentShield:
             "Content-Type": "application/json",
             "User-Agent": _SDK_USER_AGENT,
         }
+        # NOTE: employeeName is deliberately NOT sent on /check. It is an
+        # audit-trail label that belongs only on /log (where it falls back to
+        # user_id). Keeping it off /check matches the TypeScript SDK, which
+        # never sent it, so both SDKs put the same field set on the wire.
         payload: dict[str, Any] = {
             "input": redaction.redacted,
             "tenantId": self._tenant_id,
@@ -326,8 +398,6 @@ class AgentShield:
             "aiModel": self._ai_model,
             "agentId": self._agent_id,
         }
-        if self._employee_name:
-            payload["employeeName"] = self._employee_name
 
         # Single retry on transient network failures. Hard failures (4xx HTTP
         # responses, including 401/403) are surfaced immediately — retrying
@@ -344,7 +414,10 @@ class AgentShield:
                 if attempt == 0:
                     time.sleep(_RETRY_BACKOFF_SECONDS)
                     continue
-                raise RuntimeError(
+                # Named type so callers can tell "couldn't reach the server"
+                # apart from "the server said no" (ShieldConsoleError).
+                # Subclasses RuntimeError, so existing catch-alls still fire.
+                raise ShieldConnectionError(
                     f"[G8R Shield] Could not connect to console at {self._console_url} "
                     f"after retry. Is the console running?"
                 ) from exc
@@ -363,7 +436,7 @@ class AgentShield:
         # Defensive: should never reach here without `response` bound, but
         # appease the type checker for the case where the loop body changes.
         if response is None:
-            raise RuntimeError(
+            raise ShieldConnectionError(
                 f"[G8R Shield] Could not connect to console at {self._console_url}"
             ) from last_exc
 
@@ -391,6 +464,7 @@ class AgentShield:
         self,
         prompt: str,
         decision: PolicyDecision,
+        *,
         request_id: str | None = None,
     ) -> ShieldLogEntry | None:
         """

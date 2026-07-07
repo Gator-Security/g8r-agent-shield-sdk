@@ -23,11 +23,13 @@ import requests
 import responses
 from structlog.testing import capture_logs
 
+import g8r_shield
 from g8r_shield import (
     AgentShield,
     ComplianceMapping,
     PolicyDecision,
     ShieldBlockedError,
+    ShieldConnectionError,
     ShieldConsoleError,
     ShieldLogEntry,
 )
@@ -587,18 +589,20 @@ class TestPayloadShape:
         assert "description" in m
 
     @responses.activate
-    def test_check_payload_includes_employee_name_when_set(self, shield):
-
+    def test_check_payload_never_includes_employee_name_even_when_set(self, shield):
+        """Canonical parity: employeeName is an audit-trail label sent ONLY on
+        /log, never on /check — matching the TypeScript SDK, which never sent
+        it. The fixture sets employee_name='Test User'; it must not appear on
+        /check."""
         responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
 
         shield.check("test", log=False)
 
         body = json.loads(responses.calls[0].request.body)
-        assert body["employeeName"] == "Test User"
+        assert "employeeName" not in body
 
     @responses.activate
     def test_check_payload_omits_employee_name_when_none(self):
-
         s = AgentShield(
             tenant_id="tenant-test",
             console_url=CONSOLE_URL,
@@ -611,8 +615,8 @@ class TestPayloadShape:
         s.check("test", log=False)
 
         body = json.loads(responses.calls[0].request.body)
-        # The check payload OMITS employeeName when None (vs. log payload which
-        # falls back to user_id). Documented behavior.
+        # The /check payload never carries employeeName (vs. the /log payload,
+        # which falls back to user_id). Canonical cross-SDK contract.
         assert "employeeName" not in body
 
     @responses.activate
@@ -641,13 +645,14 @@ class TestPayloadShape:
         # Verify UUID4 shape — _uuid.UUID() raises ValueError on a malformed string.
         _uuid.UUID(check_body["requestId"])
         _uuid.UUID(log_body["requestId"])
-        # When check() is called standalone (not via wrap), /check and /log
-        # generate independent request_ids — each public-method entry point
-        # mints its own correlation id.
-        assert check_body["requestId"] != log_body["requestId"]
+        # Canonical parity: standalone check() mints ONE request_id up front and
+        # threads it through both /check and /log so the policy decision and its
+        # audit line correlate end-to-end — the same single-id behavior wrap()
+        # relies on. (Previously each internal call minted its own id.)
+        assert check_body["requestId"] == log_body["requestId"]
 
     @responses.activate
-    def test_c2_wrap_uses_single_request_id_for_check_and_log(self, shield):
+    def test_wrap_uses_single_request_id_for_check_and_log(self, shield):
         """wrap() emits the same request_id to /check and /log.
 
         End-to-end correlation requires that a single shield.wrap() invocation
@@ -685,3 +690,344 @@ class TestFailClosed:
         decision = shield.check("test", log=False)
 
         assert decision.decision == "blocked"  # fail-closed
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# check(request_id=...) — explicit correlation id knob
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestCheckRequestId:
+    @responses.activate
+    def test_explicit_request_id_used_verbatim_on_check(self, shield):
+        """A caller-supplied request_id is stamped verbatim on /check."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        shield.check("test", request_id="fixed-corr-id-123", log=False)
+
+        body = json.loads(responses.calls[0].request.body)
+        assert body["requestId"] == "fixed-corr-id-123"
+
+    @responses.activate
+    def test_explicit_request_id_shared_across_check_and_log(self, shield):
+        """When request_id is supplied AND log=True, the SAME id lands on both
+        /check and /log — that is what makes check() self-correlating."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.check("test", request_id="corr-abc")
+
+        check_body = json.loads(responses.calls[0].request.body)
+        log_body = json.loads(responses.calls[1].request.body)
+        assert check_body["requestId"] == "corr-abc"
+        assert log_body["requestId"] == "corr-abc"
+
+    @responses.activate
+    def test_default_check_still_correlates_check_and_log(self, shield):
+        """With no explicit id, check() still mints ONE id and shares it across
+        /check and /log (canonical behavior)."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.check("test")
+
+        check_body = json.loads(responses.calls[0].request.body)
+        log_body = json.loads(responses.calls[1].request.body)
+        assert check_body["requestId"] == log_body["requestId"]
+
+    def test_request_id_and_log_are_keyword_only(self):
+        """Canonical signature: check(prompt, *, request_id=None, log=True).
+        Passing log/request_id positionally must fail — guards the wire
+        contract against a positional-arg regression."""
+        import inspect
+
+        sig = inspect.signature(AgentShield.check)
+        params = sig.parameters
+        assert params["request_id"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["log"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ShieldConnectionError — named unreachable-console type (canonical)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestShieldConnectionError:
+    """The Console-unreachable path (connection refused / timeout, even after
+    the single retry) raises a NAMED ShieldConnectionError so callers can tell
+    'couldn't reach the server' apart from 'the server said no'
+    (ShieldConsoleError)."""
+
+    @responses.activate
+    def test_raises_named_connection_error_after_retry(self, shield, mocker):
+        mocker.patch("g8r_shield.shield.time.sleep")
+        responses.add(
+            responses.POST,
+            CHECK_URL,
+            body=requests.exceptions.ConnectionError("down"),
+        )
+        responses.add(
+            responses.POST,
+            CHECK_URL,
+            body=requests.exceptions.ConnectionError("still down"),
+        )
+
+        with pytest.raises(ShieldConnectionError) as exc_info:
+            shield.check("test", log=False)
+
+        # Message names the console_url and the retry, but carries no body.
+        assert CONSOLE_URL in str(exc_info.value)
+        assert "after retry" in str(exc_info.value)
+
+    @responses.activate
+    def test_connection_error_on_timeout(self, shield, mocker):
+        mocker.patch("g8r_shield.shield.time.sleep")
+        responses.add(responses.POST, CHECK_URL, body=requests.exceptions.Timeout("t"))
+        responses.add(responses.POST, CHECK_URL, body=requests.exceptions.Timeout("t"))
+
+        with pytest.raises(ShieldConnectionError):
+            shield.check("test", log=False)
+
+    def test_is_subclass_of_runtimeerror(self):
+        """except RuntimeError catch-alls must still trip on the new type."""
+        assert issubclass(ShieldConnectionError, RuntimeError)
+
+    @responses.activate
+    def test_backward_compatible_runtimeerror_catch(self, shield, mocker):
+        mocker.patch("g8r_shield.shield.time.sleep")
+        responses.add(responses.POST, CHECK_URL, body=requests.exceptions.ConnectionError("x"))
+        responses.add(responses.POST, CHECK_URL, body=requests.exceptions.ConnectionError("x"))
+
+        with pytest.raises(RuntimeError, match="after retry"):
+            shield.check("test", log=False)
+
+    def test_distinct_from_console_error(self):
+        """The two console-failure types are not in each other's hierarchy, so
+        `except ShieldConsoleError` never swallows an unreachable-console error
+        (and vice versa)."""
+        assert not issubclass(ShieldConnectionError, ShieldConsoleError)
+        assert not issubclass(ShieldConsoleError, ShieldConnectionError)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# wrap() — exhaustive decision switch (fail-closed on unknown decision)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestWrapExhaustive:
+    @responses.activate
+    def test_unrecognized_decision_fails_closed(self, shield, mocker):
+        """A decision value the SDK doesn't know about must NOT fall through to
+        the factory. It raises ShieldBlockedError — mirrors the TS SDK's
+        ts-pattern .exhaustive()."""
+        weird = {
+            "decision": "quarantined",  # not allowed/blocked/escalated
+            "reason": "novel decision from a newer console",
+            "violatedRule": None,
+            "requiresApproval": False,
+            "sessionRevoked": False,
+            "complianceMappings": [],
+        }
+        responses.add(responses.POST, CHECK_URL, json=weird, status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        factory = mocker.Mock(return_value="should-not-run")
+        with pytest.raises(ShieldBlockedError) as exc_info:
+            shield.wrap(factory, "prompt")
+
+        factory.assert_not_called()
+        assert exc_info.value.decision == "quarantined"
+
+    @responses.activate
+    def test_unrecognized_decision_still_audit_logged(self, shield, mocker):
+        """Even the fail-closed unknown-decision path logs before raising."""
+        weird = {
+            "decision": "quarantined",
+            "reason": "novel",
+            "violatedRule": None,
+            "requiresApproval": False,
+            "sessionRevoked": False,
+            "complianceMappings": [],
+        }
+        responses.add(responses.POST, CHECK_URL, json=weird, status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        with pytest.raises(ShieldBlockedError):
+            shield.wrap(lambda: None, "prompt")
+
+        # /check then /log both fired before the raise.
+        assert len(responses.calls) == 2
+        assert responses.calls[1].request.url == LOG_URL
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# wrap() ↔ check() single-call-graph parity
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestWrapRoutesThroughCheck:
+    @responses.activate
+    def test_wrap_emits_exactly_one_log_line(self, shield):
+        """wrap() reuses check(log=False) then logs once explicitly — so a
+        wrap() invocation produces exactly ONE /log entry, not two."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.wrap(lambda: "ok", "prompt")
+
+        log_calls = [c for c in responses.calls if c.request.url == LOG_URL]
+        check_calls = [c for c in responses.calls if c.request.url == CHECK_URL]
+        assert len(check_calls) == 1
+        assert len(log_calls) == 1
+
+    @responses.activate
+    def test_wrap_check_and_log_omit_employee_name_on_check_only(self, shield):
+        """Through wrap(): /check omits employeeName, /log carries it."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.wrap(lambda: "ok", "prompt")
+
+        check_body = json.loads(responses.calls[0].request.body)
+        log_body = json.loads(responses.calls[1].request.body)
+        assert "employeeName" not in check_body
+        assert log_body["employeeName"] == "Test User"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Canonical parity / contract test
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestCanonicalContract:
+    """Asserts the AgentShield surface matches the canonical cross-SDK
+    contract EXACTLY: the constructor field set + defaults, required/optional
+    split, method signatures, the error taxonomy, and the synchronized
+    version. If any of these drift, Python↔TypeScript parity is broken and
+    this test fails loudly."""
+
+    CANONICAL_VERSION = "0.2.0"
+
+    def test_constructor_exposes_exactly_the_canonical_fields(self):
+        import inspect
+
+        sig = inspect.signature(AgentShield.__init__)
+        params = {name for name in sig.parameters if name != "self"}
+        assert params == {
+            "tenant_id",
+            "console_url",
+            "api_key",
+            "department",
+            "user_id",
+            "employee_name",
+            "ai_model",
+            "agent_id",
+            "timeout",
+            "block_on_escalated",
+        }
+
+    def test_constructor_params_are_keyword_only(self):
+        """Every field is keyword-only — there are no positional required
+        args (tenant_id is required but still keyword-only, so callers can't
+        accidentally pass a secret positionally)."""
+        import inspect
+
+        sig = inspect.signature(AgentShield.__init__)
+        for name, p in sig.parameters.items():
+            if name == "self":
+                continue
+            assert p.kind is inspect.Parameter.KEYWORD_ONLY, name
+
+    def test_canonical_defaults(self):
+        """The DEFAULTED actor fields carry the exact canonical defaults."""
+        import inspect
+
+        defaults = {
+            name: p.default
+            for name, p in inspect.signature(AgentShield.__init__).parameters.items()
+        }
+        assert defaults["console_url"] is None
+        assert defaults["api_key"] is None
+        assert defaults["department"] == "General"
+        assert defaults["user_id"] == "unknown"
+        assert defaults["employee_name"] is None
+        assert defaults["ai_model"] == "unknown"
+        assert defaults["agent_id"] == "sdk-client"
+        assert defaults["timeout"] == 10.0
+        assert defaults["block_on_escalated"] is False
+
+    def test_tenant_id_is_the_sole_hard_required_field(self):
+        """tenant_id has no default; everything else does (env-fallback fields
+        default to None and resolve at runtime)."""
+        import inspect
+
+        params = inspect.signature(AgentShield.__init__).parameters
+        assert params["tenant_id"].default is inspect.Parameter.empty
+        for name, p in params.items():
+            if name in ("self", "tenant_id"):
+                continue
+            assert p.default is not inspect.Parameter.empty, name
+
+    def test_check_signature_is_canonical(self):
+        import inspect
+
+        params = inspect.signature(AgentShield.check).parameters
+        assert list(params) == ["self", "prompt", "request_id", "log"]
+        assert params["request_id"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["request_id"].default is None
+        assert params["log"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["log"].default is True
+
+    def test_wrap_signature_is_canonical(self):
+        import inspect
+
+        params = inspect.signature(AgentShield.wrap).parameters
+        # Python: wrap(self, factory, prompt)
+        assert list(params) == ["self", "factory", "prompt"]
+
+    def test_log_is_internal_not_public(self):
+        """_log is underscore-prefixed (internal) and not exported."""
+        assert hasattr(AgentShield, "_log")
+        assert "_log" not in g8r_shield.__all__
+
+    def test_error_taxonomy(self):
+        """The three canonical error types exist with the canonical hierarchy:
+        ShieldBlockedError (Exception), ShieldConsoleError (RuntimeError),
+        ShieldConnectionError (RuntimeError)."""
+        assert issubclass(ShieldBlockedError, Exception)
+        assert not issubclass(ShieldBlockedError, RuntimeError)
+        assert issubclass(ShieldConsoleError, RuntimeError)
+        assert issubclass(ShieldConnectionError, RuntimeError)
+
+    def test_all_three_error_types_exported(self):
+        for name in ("ShieldBlockedError", "ShieldConsoleError", "ShieldConnectionError"):
+            assert name in g8r_shield.__all__
+
+    def test_console_error_message_never_leaks_body(self):
+        """The security-critical rule: the console error message exposes only
+        the status, never the raw body."""
+        exc = ShieldConsoleError(500, detail="secret-token-leak")
+        assert "secret-token-leak" not in str(exc)
+        assert "HTTP 500" in str(exc)
+        assert exc.detail == "secret-token-leak"  # available for opt-in inspection
+
+    def test_version_is_canonical(self):
+        """Both SDKs land on the SAME 0.2.0 so 'are these in parity?' is a
+        version-equality check in CI."""
+        assert g8r_shield.__version__ == self.CANONICAL_VERSION
+
+    def test_user_agent_reflects_canonical_version(self):
+        from g8r_shield.shield import _SDK_USER_AGENT
+
+        expected_ua = f"g8r-shield-python/{self.CANONICAL_VERSION}"
+        assert expected_ua == _SDK_USER_AGENT
+
+    def test_repr_never_exposes_api_key(self):
+        """Contract: api_key must never appear in repr/str."""
+        s = AgentShield(
+            tenant_id="t1",
+            console_url="https://c.example.com",
+            api_key="sk-super-secret-abc123",
+        )
+        assert "sk-super-secret-abc123" not in repr(s)
+        assert "api_key" not in repr(s)

@@ -55,6 +55,7 @@ from .shield import (  # noqa: E402 — intentionally after structlog.configure
     ComplianceMapping,
     PolicyDecision,
     ShieldBlockedError,
+    ShieldConnectionError,
     ShieldConsoleError,
     ShieldLogEntry,
 )
@@ -75,6 +76,7 @@ __all__ = [
     "ComplianceMapping",
     "PolicyDecision",
     "ShieldBlockedError",
+    "ShieldConnectionError",
     "ShieldConsoleError",
     "ShieldLogEntry",
     "__version__",
