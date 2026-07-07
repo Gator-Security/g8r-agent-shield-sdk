@@ -1,0 +1,42 @@
+{
+  "_note": "IP-guard for the PUBLIC g8r SDK repo (used by the g8r-sdk-docs harness lane). Surface = the customer-facing READMEs + the shipped source trees (js/src, python/g8r_shield) + published examples — what customers read/import. Mirrors the marker set of the CI internal-ref guard (js/scripts/consumer-smoke-test.sh) so the harness gate and CI agree. C01-C08 bare labels are PUBLISHED architecture and NOT flagged; only C0N-N sub-refs are.",
+  "surface": [
+    "README.md",
+    "js/README.md",
+    "python/README.md",
+    "js/src/**/*.ts",
+    "python/g8r_shield/**/*.py",
+    "python/example_*.py"
+  ],
+  "markers": {
+    "dev-artifact": {
+      "severity": "medium",
+      "patterns": ["BUG-[0-9]{2,4}", "\\b(TODO|FIXME|HACK|XXX)\\b"]
+    },
+    "internal-spec-ref": {
+      "severity": "high",
+      "patterns": [
+        "foundation-[0-9]", "\\bF0[0-9]\\b", "\\bR-P[0-9]", "\\bIMP-[0-9]",
+        "\\brm-w[0-9]", "\\baprs-?[0-9]", "\\bRM-PR[0-9]", "\\bI-[0-9]\\b",
+        "\\bSB-[0-9A-Z]\\b", "\\bC0[0-9]-[0-9]", "\\bT[0-9][a-z]?\\b", "pdp-legacy"
+      ]
+    },
+    "internal-arch": {
+      "severity": "high",
+      "patterns": ["gf-(compliance|identity|pdp|egress|management|audit|registry)", "internal/(pdp|detect|judge|benchmark)"]
+    },
+    "proprietary-logic": {
+      "severity": "critical",
+      "patterns": ["llm_judge", "requiredDetectors", "slow.?detector", "\\bF8 judge\\b"]
+    },
+    "crosswalk": {
+      "severity": "high",
+      "patterns": ["compute_control_verdict", "compute_domain_rollup"]
+    },
+    "codename": {
+      "severity": "high",
+      "patterns": ["\\bC2\\b", "\\bG1\\b", "\\bG2\\b", "unauthorized partner data access", "filevine"]
+    }
+  },
+  "allow": []
+}
