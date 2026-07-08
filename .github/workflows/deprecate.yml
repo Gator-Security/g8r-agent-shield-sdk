@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       range:
-        description: 'Semver range to deprecate (e.g. "<0.2.0" or "0.1.2")'
+        description: 'Semver range to deprecate (e.g. "0.1.2" or "<0.2.0"). Note: 0.1.0/0.1.1 already carry a SECURITY deprecation — do not overwrite it.'
         required: true
-        default: '<0.2.0'
+        default: '0.1.2'
       message:
         description: 'Deprecation message ("" to UN-deprecate)'
         required: true
@@ -20,9 +20,6 @@ jobs:
   deprecate:
     name: npm deprecate
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: js
     steps:
       - uses: actions/setup-node@v4
         with:
