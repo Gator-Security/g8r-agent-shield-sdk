@@ -73,7 +73,7 @@ const cfg: ShieldConfig = {
 const shield = new AgentShield(cfg);
 const _check: Promise<PolicyCheckResult> = shield.check('hello');
 const _redaction: RedactionResult = redactSensitiveData('hello');
-const _err: Error = new ShieldBlockedError('blocked', null, []);
+const _err: Error = new ShieldBlockedError('block', 'blocked', null, []);
 void _check;
 void _redaction;
 void _err;
@@ -102,7 +102,7 @@ echo "==> Asserting no internal references leaked into source or published artif
 PKG_DIR="$WORK/node_modules/@g8r-security/agent-shield-sdk"
 # Repo (monorepo) root, computed from this script's own location so the guard
 # works regardless of the caller's cwd. Script lives at <root>/js/scripts.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(dirname "$SDK_DIR")"
 
 # Internal-reference markers. grep -riE, boundary-anchored (\b) so short tokens
 # like T3 or I-4 don't match ordinary words. Grouped by category:
@@ -148,7 +148,7 @@ done
 # attributable (-H is portable to both BSD/macOS and GNU/Linux grep, unlike the
 # GNU-only --with-filename long form). A match means a leak -> fail; no match is
 # the clean path.
-if grep -rniE -H "$INTERNAL_MARKERS" "${INTERNAL_SCAN_TARGETS[@]}"; then
+if grep -rniE -H --exclude-dir=__pycache__ --exclude='*.pyc' --exclude='*.map' "$INTERNAL_MARKERS" "${INTERNAL_SCAN_TARGETS[@]}"; then
   echo "    FAIL: internal reference found (file:line printed above)"
   exit 1
 fi
