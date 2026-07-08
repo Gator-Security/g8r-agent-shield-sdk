@@ -1,0 +1,36 @@
+name: Deprecate versions
+
+# Manual, auditable npm deprecate — reuses the Automation NPM_TOKEN (bypasses 2FA)
+# so a maintainer never has to expose a token locally. Run from the Actions tab or:
+#   gh workflow run "Deprecate versions" --repo Gator-Security/g8r-agent-shield-sdk \
+#     -f range='<0.2.0' -f message='Superseded by 0.2.0 — please upgrade.'
+on:
+  workflow_dispatch:
+    inputs:
+      range:
+        description: 'Semver range to deprecate (e.g. "<0.2.0" or "0.1.2")'
+        required: true
+        default: '<0.2.0'
+      message:
+        description: 'Deprecation message ("" to UN-deprecate)'
+        required: true
+        default: 'Superseded by 0.2.0 — please upgrade (npm i @g8r-security/agent-shield-sdk@latest). Pre-0.2.0 releases are no longer maintained.'
+
+jobs:
+  deprecate:
+    name: npm deprecate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: js
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Deprecate
+        run: npm deprecate "@g8r-security/agent-shield-sdk@${{ inputs.range }}" "${{ inputs.message }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Show result
+        run: npm view @g8r-security/agent-shield-sdk versions --json && npm view "@g8r-security/agent-shield-sdk@${{ inputs.range }}" deprecated
