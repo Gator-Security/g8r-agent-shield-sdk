@@ -47,3 +47,64 @@ If a published version has a defect, point consumers at the fix:
 ```bash
 npm deprecate @g8r-security/agent-shield-sdk@"<X.Y.Z" "Upgrade to >=X.Y.Z — <reason>."
 ```
+
+---
+
+# Python SDK (`g8r-shield` on PyPI)
+
+Published by the [`Publish Python`](.github/workflows/publish-python.yml) workflow
+when a **`py-v*`** tag is pushed. The `py-` prefix keeps it distinct from the JS
+SDK's `v*` tags so one tag never triggers both publishers. Auth is **PyPI Trusted
+Publishing (OIDC)** — no API token is stored anywhere (the manual `twine upload`
+path below is only needed for the very first publish or a break-glass release).
+
+## One-time setup (PyPI trusted publisher)
+
+On PyPI, signed in as an owner of the `g8r-shield` project:
+**Manage → Publishing → Add a new publisher** (GitHub), with:
+
+- Owner: `Gator-Security`
+- Repository: `g8r-agent-shield-sdk`
+- Workflow name: `publish-python.yml`
+- Environment: *(leave blank, or set one and add it to the workflow)*
+
+(If the project did not yet exist you'd use a *pending publisher* with the same
+fields; here the project already exists, so add it as a normal publisher.)
+
+## Cutting a release
+
+From `main`, clean tree, bump BOTH version locations to the same value:
+
+- `python/pyproject.toml` → `version`
+- `python/g8r_shield/_version.py` → `_FALLBACK_VERSION`
+
+then:
+
+```bash
+git commit -am "python sdk: vX.Y.Z"
+git tag py-vX.Y.Z
+git push --follow-tags
+```
+
+The workflow runs ruff + mypy + pytest, asserts the tag matches `pyproject`'s
+version AND that `pyproject` and `_version.py` agree, builds sdist+wheel,
+`twine check`s them, and publishes to PyPI via OIDC. Any gate failing publishes
+nothing.
+
+## Manual publish (first release / break-glass)
+
+Build and upload with a token from `~/.pypirc` (`[pypi]`/`[testpypi]` sections,
+`username = __token__`). Dry-run on TestPyPI first:
+
+```bash
+cd python
+python -m build
+twine check dist/*
+twine upload --repository testpypi dist/*   # dry run
+twine upload dist/*                          # real PyPI
+```
+
+## Yanking a bad version
+
+PyPI can't delete, but you can **yank** (hides from new installs, keeps existing
+pins working): project page → Manage → the release → **Yank**.

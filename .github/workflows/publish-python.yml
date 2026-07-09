@@ -1,0 +1,75 @@
+name: Publish Python
+
+# Publishes the Python SDK (g8r-shield) to PyPI when a `py-v*` tag is pushed
+# (e.g. `py-v0.2.1`). The `py-` prefix keeps this distinct from the JS SDK's
+# `v*` tags, so one tag never triggers both publishers.
+#
+# Cut a release from `main` with a clean tree:
+#   cd python
+#   # bump `version` in pyproject.toml AND `_FALLBACK_VERSION` in
+#   # g8r_shield/_version.py to the SAME value, commit, then:
+#   git tag py-v0.2.1 && git push --follow-tags
+#
+# Auth is PyPI Trusted Publishing (OIDC) — NO API token is stored anywhere.
+# One-time setup on PyPI: project g8r-shield -> Manage -> Publishing -> Add a
+# pending/GitHub publisher with owner `Gator-Security`, repo
+# `g8r-agent-shield-sdk`, workflow `publish-python.yml`.
+
+on:
+  push:
+    tags:
+      - 'py-v*'
+
+jobs:
+  publish-pypi:
+    name: Build + publish to PyPI (trusted publishing)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token PyPI verifies for trusted publishing
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build + dev deps
+        run: |
+          python -m pip install --upgrade pip build twine
+          pip install -e ".[dev]"
+
+      # Every gate runs before publishing — a tag must never ship unverified.
+      - run: ruff check .
+      - run: mypy g8r_shield
+      - run: pytest -q
+
+      # Guard 1: the git tag must match pyproject's version, so `py-v0.2.1`
+      # can't accidentally publish 0.2.0.
+      # Guard 2: pyproject version and _version.py's fallback must agree, so a
+      # half-done bump can't ship a package whose __version__ lies.
+      - name: Verify tag + internal version parity
+        run: |
+          PKG="$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          FALLBACK="$(python -c "import re;print(re.search(r'_FALLBACK_VERSION\s*=\s*\"([^\"]+)\"', open('g8r_shield/_version.py').read()).group(1))")"
+          TAG="${GITHUB_REF_NAME#py-v}"
+          if [ "$PKG" != "$TAG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (=$TAG) != pyproject version $PKG"; exit 1
+          fi
+          if [ "$PKG" != "$FALLBACK" ]; then
+            echo "::error::pyproject version $PKG != _version.py _FALLBACK_VERSION $FALLBACK"; exit 1
+          fi
+          echo "tag, pyproject, and _version.py all agree on $PKG"
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - run: twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist/
+          print-hash: true
