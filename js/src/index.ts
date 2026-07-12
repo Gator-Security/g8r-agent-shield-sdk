@@ -14,6 +14,9 @@
  *     // G8R_CONSOLE_URL / G8R_API_KEY environment variables instead.
  *     consoleUrl: 'https://shield.yourcompany.com',
  *     apiKey: 'sk-shield-...',
+ *     // — or, for short-lived OIDC workload-identity JWTs, a provider that is
+ *     // awaited fresh on every request (mutually exclusive with apiKey):
+ *     // credentialProvider: () => mintWorkloadJwt(),
  *     tenantId: tenantId('acme-corp'),
  *     department: 'Finance',   // optional — defaults to 'General'
  *     userId: 'usr_FIN_042',   // optional — defaults to 'unknown'
@@ -48,7 +51,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -88,12 +91,34 @@ export interface ShieldConfig {
    */
   consoleUrl?: string;
   /**
-   * Bearer token for /api/sdk/v1/check and /log. Optional at the type level,
-   * but effectively required: resolved from this field OR the `G8R_API_KEY`
-   * env var. If neither yields a non-empty value the constructor throws. Never
-   * included in toString()/logs.
+   * Static bearer credential for /api/sdk/v1/check and /log — the deployment
+   * shared secret the customer configured server-side. Optional at the type
+   * level, but effectively required unless `credentialProvider` is set:
+   * resolved from this field OR the `G8R_API_KEY` env var. If neither yields
+   * a non-empty value (and no provider is configured) the constructor throws.
+   * Never included in toString()/logs. Mutually exclusive with
+   * `credentialProvider`.
    */
   apiKey?: string;
+  /**
+   * Callback returning (or resolving to) the bearer credential for ONE
+   * outbound request. Awaited fresh on EVERY /check and /log call, so
+   * short-lived credentials — e.g. OIDC workload-identity JWTs (AWS workload
+   * identity and friends) — never go stale inside a long-lived shield
+   * instance. The Console accepts either the deployment shared secret or a
+   * verified OIDC JWT in the same `Authorization: Bearer` header, so a static
+   * apiKey and a provider speak the identical wire contract. With a verified
+   * JWT the server trusts the JWT's tenant claim over the body's tenantId — a
+   * mismatch is HTTP 403 (a bad/missing credential is 401).
+   *
+   * Mutually exclusive with `apiKey` — the constructor throws if both are
+   * passed, and the `G8R_API_KEY` env fallback is not consulted when a
+   * provider is configured. A provider rejection fails CLOSED: it surfaces as
+   * ShieldConnectionError and wrap() never invokes the LLM factory. The
+   * returned credential is used only for the Authorization header and is
+   * never logged.
+   */
+  credentialProvider?: () => string | Promise<string>;
   /** Tenant this SDK instance operates on behalf of. The one hard-required field. */
   tenantId: TenantId;
   /** Optional: functional department for governance attribution (defaults to "General"). */
@@ -121,6 +146,29 @@ export interface PolicyCheckResult {
   reason: string;
   violatedRule: string | null;
   requiresApproval: boolean;
+  /**
+   * True when this call was blocked because the agent's trust-on-first-use
+   * registration is still pending admin approval in the Console's Approvals
+   * queue — not because a policy rule fired.
+   *
+   * Derived CLIENT-SIDE from `decision === 'blocked' && requiresApproval ===
+   * true`; this is NOT a wire field the Console sends. On a v2 Console that
+   * conjunction occurs only for pending registrations, and only when the
+   * server runs in `block` pending-agent mode:
+   *
+   *  - `flag` mode (server default): calls from a pending agent evaluate
+   *    normally under policy while admins are alerted out-of-band — the SDK
+   *    sees ordinary decisions and this flag never appears.
+   *  - `block` mode: calls return `blocked` + `requiresApproval: true` until
+   *    an admin approves the agent, and this flag is set.
+   *
+   * An admin-DENIED agent is `blocked` with `requiresApproval: false` in both
+   * modes, so this flag stays unset for it. Undefined (never `false`) when
+   * the conjunction doesn't hold, matching the present-only-when-meaningful
+   * style of `sessionRevoked`/`redactedTokens`. Reason strings are for humans
+   * and are never parsed to derive this.
+   */
+  isPendingRegistration?: boolean;
   /**
    * Set to true when a kill-switch policy fires. Consumers should tear down
    * the agent session in response.
@@ -165,7 +213,7 @@ export interface CheckOptions {
 
 export class AgentShield {
   private readonly consoleUrl: string;
-  private readonly apiKey: string;
+  private readonly credential: () => string | Promise<string>;
   private readonly tenantId: TenantId;
   private readonly department: string;
   private readonly userId: string;
@@ -191,17 +239,39 @@ export class AgentShield {
       );
     }
 
-    const resolvedKey = config.apiKey || readEnv(ENV_API_KEY);
-    if (!resolvedKey) {
+    // A static key and a per-request provider are two mutually exclusive
+    // answers to "where does the bearer credential come from". Refuse the
+    // ambiguity outright — silently preferring one usually hides a config
+    // merge bug upstream.
+    if (config.apiKey && config.credentialProvider) {
       throw new Error(
-        `apiKey is required. Pass apiKey or set the ${ENV_API_KEY} env var.`
+        'apiKey and credentialProvider are mutually exclusive. Pass exactly one credential source.'
       );
+    }
+
+    // Resolve the credential SOURCE — never the credential itself: a provider
+    // is awaited per request (see resolveCredential()), not at construction.
+    // A static key is normalized into the same closure shape as a provider so
+    // /check and /log share one resolution path. When a provider is
+    // configured the G8R_API_KEY env fallback is deliberately not consulted —
+    // an explicit provider is an explicit choice of credential source.
+    let credential: () => string | Promise<string>;
+    if (config.credentialProvider) {
+      credential = config.credentialProvider;
+    } else {
+      const resolvedKey = config.apiKey || readEnv(ENV_API_KEY);
+      if (!resolvedKey) {
+        throw new Error(
+          `apiKey is required. Pass apiKey, set the ${ENV_API_KEY} env var, or pass a credentialProvider.`
+        );
+      }
+      credential = () => resolvedKey;
     }
 
     // Store all fields (with defaults applied) as write-once instance state.
     // The instance holds no mutable state and is safe to share across loops.
     this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
-    this.apiKey = resolvedKey;
+    this.credential = credential;
     this.tenantId = config.tenantId;
     this.department = config.department ?? DEFAULT_DEPARTMENT;
     this.userId = config.userId ?? DEFAULT_USER_ID;
@@ -309,7 +379,8 @@ export class AgentShield {
           policyResult.reason,
           policyResult.violatedRule,
           policyResult.complianceMappings,
-          policyResult.sessionRevoked ?? false
+          policyResult.sessionRevoked ?? false,
+          policyResult.isPendingRegistration ?? false
         );
       })
       .with('escalated', () => {
@@ -321,7 +392,8 @@ export class AgentShield {
             policyResult.reason,
             policyResult.violatedRule,
             policyResult.complianceMappings,
-            policyResult.sessionRevoked ?? false
+            policyResult.sessionRevoked ?? false,
+            policyResult.isPendingRegistration ?? false
           );
         }
         log.warn('action_escalated', {
@@ -357,6 +429,11 @@ export class AgentShield {
       request_id: requestId,
     });
 
+    // Resolve the credential ONCE per request, before the retry loop — the
+    // retry below is for transient network failures, not credential failures,
+    // and a JWT valid at request start is still valid one backoff later.
+    const credential = await this.resolveCredential();
+
     const url = `${this.consoleUrl}/api/sdk/v1/check`;
     const body = JSON.stringify({
       input: redacted, // send the redacted version — never the raw prompt
@@ -378,7 +455,7 @@ export class AgentShield {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.apiKey}`,
+            Authorization: `Bearer ${credential}`,
             'User-Agent': SDK_USER_AGENT,
           },
           body,
@@ -418,6 +495,14 @@ export class AgentShield {
       reason: data.reason,
       violatedRule: data.violatedRule ?? null,
       requiresApproval: data.requiresApproval ?? false,
+      // Derived CLIENT-SIDE — NOT a wire field. On a v2 Console the
+      // conjunction decision=='blocked' && requiresApproval==true occurs ONLY
+      // while an agent's trust-on-first-use registration is pending admin
+      // approval (server pending-agent mode 'block'). Reason strings are for
+      // humans and are never parsed for this.
+      ...(data.decision === 'blocked' && data.requiresApproval === true
+        ? { isPendingRegistration: true }
+        : {}),
       ...(data.sessionRevoked !== undefined ? { sessionRevoked: data.sessionRevoked } : {}),
       complianceMappings: data.complianceMappings ?? [],
       ...(tokensReplaced.length > 0 ? { redactedTokens: tokensReplaced } : {}),
@@ -431,7 +516,10 @@ export class AgentShield {
    * carry raw secrets/PII, and this is an egress point just like /check.
    *
    * Failures are logged and swallowed (returns null) — a logging outage must
-   * NEVER break the user's LLM call or mask the decision path.
+   * NEVER break the user's LLM call or mask the decision path. The single
+   * deliberate exception is credential RESOLUTION: a rejecting
+   * credentialProvider propagates (fail closed), because it means the SDK can
+   * no longer authenticate at all — see resolveCredential().
    */
   private async log(
     input: string,
@@ -448,11 +536,20 @@ export class AgentShield {
     const { redacted } = redactSensitiveData(input);
 
     try {
+      // Resolve the credential INSIDE the swallow-all block: a provider
+      // rejection on the audit path is a logging failure like any other —
+      // an actual 401 from /log would be swallowed below, so a local
+      // provider hiccup must not be treated more strictly than a real auth
+      // rejection. Fail-closed protection lives on the /check leg, which
+      // resolves the credential before any decision is rendered. (Parity:
+      // the Python SDK behaves identically.)
+      const credential = await this.resolveCredential();
+
       const res = await fetch(`${this.consoleUrl}/api/sdk/v1/log`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
+          Authorization: `Bearer ${credential}`,
           'User-Agent': SDK_USER_AGENT,
         },
         body: JSON.stringify({
@@ -487,6 +584,38 @@ export class AgentShield {
       return null;
     }
   }
+
+  /**
+   * Resolve the bearer credential for ONE outbound request. Static-key
+   * configs resolve instantly; a configured credentialProvider is awaited
+   * fresh on every call so short-lived credentials (e.g. OIDC workload JWTs)
+   * never go stale inside a long-lived shield instance.
+   *
+   * A provider rejection fails CLOSED as ShieldConnectionError: no request
+   * was sent, which is the same "could not complete the exchange with the
+   * console" failure mode as an unreachable console — as opposed to
+   * ShieldConsoleError, which asserts the console actually answered. The
+   * rejection is never retried here: the provider is customer code, and its
+   * retry policy belongs to the provider itself. The resolved credential is
+   * handed to the caller for the Authorization header only and is NEVER
+   * logged.
+   */
+  private async resolveCredential(): Promise<string> {
+    try {
+      return await this.credential();
+    } catch (err) {
+      // Log the failure (never the credential — there is none to leak, and
+      // the provider's error is preserved on `.cause` rather than stringified
+      // into a log line that downstream pipelines might surface).
+      log.error('credential_provider_failed', { tenant_id: this.tenantId });
+      throw new ShieldConnectionError(
+        this.consoleUrl,
+        err,
+        '[G8R Shield] credentialProvider rejected — no request was sent to the console. ' +
+          'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
+      );
+    }
+  }
 }
 
 /**
@@ -499,13 +628,24 @@ export class ShieldBlockedError extends Error {
   public readonly violatedRule: string | null;
   public readonly complianceMappings: PolicyCheckResult['complianceMappings'];
   public readonly sessionRevoked: boolean;
+  /**
+   * True when the block is the trust-on-first-use pending-registration gate
+   * (see {@link PolicyCheckResult.isPendingRegistration}) rather than a policy
+   * verdict — the agent is awaiting admin approval in the Console's Approvals
+   * queue. Integrators can branch on this to prompt "approve the agent, then
+   * retry" instead of treating the block as a policy violation. Always false
+   * for admin-DENIED agents (those are `blocked` with `requiresApproval:
+   * false`) and for every decision on a server in `flag` pending-agent mode.
+   */
+  public readonly isPendingRegistration: boolean;
 
   constructor(
     decision: string,
     reason: string,
     violatedRule: string | null,
     complianceMappings: PolicyCheckResult['complianceMappings'],
-    sessionRevoked: boolean = false
+    sessionRevoked: boolean = false,
+    isPendingRegistration: boolean = false
   ) {
     super(`[G8R Shield BLOCKED] ${reason}`);
     this.name = 'ShieldBlockedError';
@@ -514,6 +654,7 @@ export class ShieldBlockedError extends Error {
     this.violatedRule = violatedRule;
     this.complianceMappings = complianceMappings;
     this.sessionRevoked = sessionRevoked;
+    this.isPendingRegistration = isPendingRegistration;
     // Restore prototype chain for `instanceof` after transpilation to ES targets
     // that don't preserve it across `extends Error`.
     Object.setPrototypeOf(this, ShieldBlockedError.prototype);
@@ -547,14 +688,21 @@ export class ShieldConsoleError extends Error {
  * (connection refused / timeout). Names the console URL and that a retry was
  * attempted, but carries no response body. Lets callers distinguish
  * "server said no" (ShieldConsoleError) from "couldn't reach server".
+ *
+ * Also thrown when a configured credentialProvider rejects: no request can
+ * leave the process without a credential, which is the same
+ * "could not complete the exchange" failure mode — the `message` override
+ * names the provider so operators aren't sent chasing a healthy console, and
+ * `.cause` carries the provider's rejection.
  */
 export class ShieldConnectionError extends Error {
   public readonly consoleUrl: string;
   public readonly cause?: unknown;
 
-  constructor(consoleUrl: string, cause?: unknown) {
+  constructor(consoleUrl: string, cause?: unknown, message?: string) {
     super(
-      `[G8R Shield] Could not connect to console at ${consoleUrl} after retry. Is the console running?`
+      message ??
+        `[G8R Shield] Could not connect to console at ${consoleUrl} after retry. Is the console running?`
     );
     this.name = 'ShieldConnectionError';
     this.consoleUrl = consoleUrl;

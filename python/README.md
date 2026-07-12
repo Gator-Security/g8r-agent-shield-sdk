@@ -82,7 +82,8 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 | -------------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
 | `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty |
 | `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback) |
-| `api_key`            | `str`           | Yes\*    | `G8R_API_KEY` env                           | API key for authentication. Pass directly or set `G8R_API_KEY`; a missing value raises `ValueError` |
+| `api_key`            | `str`           | Yes\*    | `G8R_API_KEY` env                           | Static Bearer credential (your deployment's shared secret). Pass directly or set `G8R_API_KEY`; a missing value raises `ValueError`. Mutually exclusive with `credential_provider` |
+| `credential_provider` | `Callable[[], str]` | No  | `None`                                      | Zero-argument callable returning the Bearer credential, invoked fresh for every request — for short-lived tokens such as OIDC JWTs. Mutually exclusive with an explicit `api_key` (`ValueError` if both are passed); when set, `G8R_API_KEY` is ignored. See [Short-lived credentials](#short-lived-credentials-oidc--aws-workload-identity) |
 | `department`         | `str`           | No       | `"General"`                                 | Department of the calling user           |
 | `user_id`            | `str`           | No       | `"unknown"`                                 | User identifier                          |
 | `employee_name`      | `str \| None`   | No       | `None` (falls back to `user_id` in logs)    | Display name for audit trail             |
@@ -117,6 +118,7 @@ Evaluate a prompt and conditionally execute the LLM call. The interaction is log
 | `session_revoked`     | `bool`                     | Whether the agent session was revoked                |
 | `compliance_mappings` | `list[ComplianceMapping]`  | Regulatory controls implicated by the decision       |
 | `redacted_tokens`     | `list[str]`                | Sensitive tokens stripped from the prompt by the local-first redaction layer before it reached the gateway; empty when the prompt was clean |
+| `is_pending_registration` | `bool` (read-only property) | `True` only when `decision == "blocked"` and `requires_approval` — the v2 signal that the agent's registration is awaiting admin approval. See [Agent registration](#agent-registration-trust-on-first-use) |
 
 ### `ShieldBlockedError`
 
@@ -125,8 +127,10 @@ Evaluate a prompt and conditionally execute the LLM call. The interaction is log
 | `decision`            | `str`                      | The blocking decision (`"blocked"`)                  |
 | `reason`              | `str`                      | Human-readable rationale                             |
 | `violated_rule`       | `str \| None`              | Name of the rule that blocked the action             |
+| `requires_approval`   | `bool`                     | Whether human approval is required                   |
 | `session_revoked`     | `bool`                     | Whether the agent session was revoked                |
 | `compliance_mappings` | `list[ComplianceMapping]`  | Compliance frameworks and controls violated          |
+| `is_pending_registration` | `bool` (read-only property) | Mirror of `PolicyDecision.is_pending_registration` — distinguishes "awaiting admin approval" from "policy blocked" without a second round-trip |
 
 ### `ComplianceMapping`
 
@@ -174,6 +178,54 @@ if decision.decision == "blocked":
     print("Would have been blocked:", decision.reason)
 ```
 
+## Short-lived credentials (OIDC / AWS workload identity)
+
+Consoles that verify OIDC JWTs (issuer, JWKS, and audience configured server-side) accept a workload-identity token in place of the static shared secret. Because those tokens expire, pass a `credential_provider` instead of `api_key` — the SDK invokes it fresh for **every** request (both `/check` and `/log`), so a token refreshed mid-session is picked up automatically:
+
+```python
+from g8r_shield import AgentShield
+
+def fetch_workload_jwt() -> str:
+    # Return the current OIDC JWT for this workload, e.g. read the
+    # AWS-injected identity token file (refreshed by the platform).
+    with open("/var/run/secrets/tokens/g8r-shield-token") as f:
+        return f.read().strip()
+
+shield = AgentShield(
+    tenant_id="acme-corp",
+    console_url="https://shield.yourcompany.com",
+    credential_provider=fetch_workload_jwt,
+    agent_id="billing-agent",
+)
+```
+
+- `credential_provider` and an explicit `api_key` are mutually exclusive — passing both raises `ValueError`. When a provider is set, the `G8R_API_KEY` env var is ignored.
+- If the provider raises during the policy check, the SDK raises `ShieldConnectionError` and the wrapped LLM call **never executes** (fail closed). A provider failure on the audit-log leg is swallowed like any other logging failure (a logging outage never breaks the decision path). The provider's return value is never logged.
+- The Console verifies the JWT's tenant claim against the request's `tenant_id`; a mismatch is rejected with `403` (surfaced as `ShieldConsoleError`).
+
+## Agent registration (trust-on-first-use)
+
+The **first** call from an unknown `agent_id` automatically creates a *pending* registration in the Console's Approvals queue. What happens next depends on the Console's pending-agent mode:
+
+- **flag** (server default) — calls from the pending agent evaluate normally under policy while admins approve in the background. Your integration needs no changes.
+- **block** — calls from the pending agent return `blocked` with `requires_approval` until an admin approves it, so `wrap()` raises `ShieldBlockedError`.
+
+On v2, `decision == "blocked"` together with `requires_approval` occurs **only** for a pending registration — the SDK exposes that conjunction as `is_pending_registration` (on both `PolicyDecision` and `ShieldBlockedError`) so you can distinguish "awaiting admin approval" from "policy blocked" without parsing reason strings:
+
+```python
+from g8r_shield import ShieldBlockedError
+
+try:
+    result = shield.wrap(lambda: call_llm(prompt), prompt)
+except ShieldBlockedError as err:
+    if err.is_pending_registration:
+        print("Agent awaiting approval in the Console Approvals queue — retry later.")
+    else:
+        print("Blocked by policy:", err.violated_rule)
+```
+
+An agent an admin has *denied* comes back `blocked` **without** `requires_approval` (in both modes), so it correctly reads as a policy block, not a pending one.
+
 ## AWS Bedrock example
 
 See [example_bedrock.py](example_bedrock.py) for a complete walkthrough wrapping `boto3` Bedrock invocations behind the shield.
@@ -200,7 +252,7 @@ The SDK communicates with two endpoints on the Agent Shield Console:
 | `/api/sdk/v1/check` | POST   | Evaluate a prompt against the policy engine |
 | `/api/sdk/v1/log`   | POST   | Log an interaction to the audit trail       |
 
-Both require an `Authorization: Bearer <api_key>` header. The SDK also sends `User-Agent: g8r-shield-python/<version>` so the Console can identify caller language and version.
+Both require an `Authorization: Bearer <credential>` header, where the credential is either your deployment's shared secret (`api_key` / `G8R_API_KEY`) or a verified OIDC JWT supplied via `credential_provider`. A bad or missing credential returns `401`; a JWT whose tenant claim does not match the request's `tenant_id` returns `403` (the verified claim wins). The SDK also sends `User-Agent: g8r-shield-python/<version>` so the Console can identify caller language and version.
 
 ## Requirements
 

@@ -11,6 +11,10 @@ Covers:
 - Value object immutability — frozen=True on dataclasses
 - Payload shape — User-Agent header, employee_name fallback to user_id,
                   compliance mappings serialization
+- credential_provider — per-request invocation on /check AND /log, mutual
+                        exclusion with api_key, fail-closed provider errors
+- is_pending_registration — v2 pending-registration truth table on
+                            PolicyDecision and ShieldBlockedError
 """
 
 from __future__ import annotations
@@ -40,9 +44,11 @@ from .conftest import (
     LOG_URL,
     allowed_response,
     blocked_response,
+    denied_registration_response,
     escalated_response,
     kill_switch_response,
     log_response,
+    pending_registration_response,
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -108,6 +114,7 @@ class TestConstruction:
         assert set(AgentShield.__slots__) == {
             "_console_url",
             "_api_key",
+            "_credential_provider",
             "_tenant_id",
             "_department",
             "_user_id",
@@ -895,6 +902,237 @@ class TestWrapRoutesThroughCheck:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# credential_provider — per-request dynamic Bearer credentials (v2 OIDC path)
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestCredentialProvider:
+    """The dynamic credential path: a zero-argument callable resolved fresh
+    for EVERY outbound request (both /check and /log), so short-lived OIDC
+    JWTs (e.g. AWS workload identity) never go stale inside a long-lived
+    AgentShield instance. Mutually exclusive with an explicit api_key;
+    provider failures fail CLOSED on the check path."""
+
+    @staticmethod
+    def _provider_shield(provider) -> AgentShield:
+        return AgentShield(
+            tenant_id="tenant-test",
+            console_url=CONSOLE_URL,
+            credential_provider=provider,
+        )
+
+    def test_constructs_without_api_key_or_env(self, monkeypatch):
+        """The provider alone satisfies the credential requirement — no
+        api_key argument, no G8R_API_KEY env var."""
+        monkeypatch.delenv("G8R_API_KEY", raising=False)
+        s = self._provider_shield(lambda: "jwt-abc")
+        assert s._credential_provider is not None
+
+    def test_explicit_api_key_and_provider_raises(self):
+        """Two explicit credential sources is a config bug — fail fast."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            AgentShield(
+                tenant_id="t1",
+                console_url=CONSOLE_URL,
+                api_key="sk-static",
+                credential_provider=lambda: "jwt-abc",
+            )
+
+    @responses.activate
+    def test_provider_wins_over_env_api_key(self, monkeypatch):
+        """A stale G8R_API_KEY left in the deployment env must never shadow
+        the provider the caller opted into."""
+        monkeypatch.setenv("G8R_API_KEY", "stale-env-secret")
+        s = self._provider_shield(lambda: "jwt-abc")
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        s.check("test", log=False)
+
+        auth = responses.calls[0].request.headers["Authorization"]
+        assert auth == "Bearer jwt-abc"
+        assert "stale-env-secret" not in auth
+
+    @responses.activate
+    def test_provider_called_per_request_on_check_and_log(self):
+        """One check() with logging = two requests = two provider calls, and
+        each request carries the value the provider returned for IT — proof
+        the credential is resolved per request, never cached."""
+        tokens = iter(["jwt-first", "jwt-second"])
+        calls = []
+
+        def provider() -> str:
+            token = next(tokens)
+            calls.append(token)
+            return token
+
+        s = self._provider_shield(provider)
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        s.check("test")
+
+        assert calls == ["jwt-first", "jwt-second"]
+        assert responses.calls[0].request.url == CHECK_URL
+        assert responses.calls[0].request.headers["Authorization"] == "Bearer jwt-first"
+        assert responses.calls[1].request.url == LOG_URL
+        assert responses.calls[1].request.headers["Authorization"] == "Bearer jwt-second"
+
+    @responses.activate
+    def test_provider_exception_fails_closed_factory_never_called(self, mocker):
+        """A provider failure on the check path raises ShieldConnectionError
+        BEFORE anything goes on the wire — the wrapped LLM call must not
+        proceed unevaluated."""
+
+        def provider() -> str:
+            raise RuntimeError("token endpoint unreachable")
+
+        s = self._provider_shield(provider)
+        factory = mocker.Mock(return_value="never")
+
+        with pytest.raises(ShieldConnectionError):
+            s.wrap(factory, "prompt")
+
+        factory.assert_not_called()
+        assert len(responses.calls) == 0  # nothing reached the console
+
+    def test_provider_exception_message_not_leaked(self):
+        """The provider's own message could carry token material; it lives on
+        __cause__ (opt-in), never in str(exc)."""
+
+        def provider() -> str:
+            raise RuntimeError("secret-jwt-material-do-not-echo")
+
+        s = self._provider_shield(provider)
+
+        with pytest.raises(ShieldConnectionError) as exc_info:
+            s.check("test", log=False)
+
+        assert "secret-jwt-material-do-not-echo" not in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+    @responses.activate
+    def test_provider_failure_on_log_path_is_swallowed(self):
+        """A provider that fails only when /log resolves its credential is a
+        logging failure like any other — warned, never raised, decision path
+        intact."""
+        outcomes = iter(["jwt-ok"])  # first call succeeds, second exhausts → StopIteration
+
+        s = self._provider_shield(lambda: next(outcomes))
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with capture_logs() as logs:
+            result = s.wrap(lambda: "ok", "safe prompt")
+
+        assert result == "ok"
+        fail_logs = [e for e in logs if e.get("event") == "log_failed"]
+        assert len(fail_logs) == 1
+        assert fail_logs[0]["log_level"] == "error"
+
+    def test_provider_error_backward_compatible_runtimeerror_catch(self):
+        """except RuntimeError catch-alls must still trip on provider failure
+        (ShieldConnectionError subclasses RuntimeError)."""
+
+        def provider() -> str:
+            raise ValueError("bad token config")
+
+        s = self._provider_shield(provider)
+
+        with pytest.raises(RuntimeError, match="failing closed"):
+            s.check("test", log=False)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# is_pending_registration — v2 trust-on-first-use pending signal
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class TestIsPendingRegistration:
+    """The v2 detection rule: decision=='blocked' AND requires_approval is
+    the ONLY conjunction a pending registration (server in block mode)
+    produces. Everything else — plain policy blocks, admin-denied agents,
+    escalations — must read False. Logic branches on the flags, never on
+    the human-readable reason string."""
+
+    @staticmethod
+    def _decision(decision: str, requires_approval: bool) -> PolicyDecision:
+        return PolicyDecision(
+            decision=decision,
+            reason="",
+            violated_rule=None,
+            requires_approval=requires_approval,
+            session_revoked=False,
+        )
+
+    def test_blocked_with_requires_approval_is_pending(self):
+        assert self._decision("blocked", True).is_pending_registration is True
+
+    def test_blocked_without_requires_approval_is_not_pending(self):
+        """Plain policy block — and the admin-DENIED registration shape."""
+        assert self._decision("blocked", False).is_pending_registration is False
+
+    def test_escalated_with_requires_approval_is_not_pending(self):
+        """Escalations carry requiresApproval too; without 'blocked' they are
+        human-in-the-loop review, not a pending registration."""
+        assert self._decision("escalated", True).is_pending_registration is False
+
+    def test_allowed_is_not_pending(self):
+        assert self._decision("allowed", False).is_pending_registration is False
+
+    @responses.activate
+    def test_pending_response_parsed_from_wire(self, shield):
+        responses.add(responses.POST, CHECK_URL, json=pending_registration_response(), status=200)
+
+        decision = shield.check("first call from a new agent", log=False)
+
+        assert decision.is_pending_registration is True
+
+    @responses.activate
+    def test_denied_response_parsed_from_wire(self, shield):
+        """Admin-denied: blocked, requiresApproval False — NOT pending, even
+        though the reason string mentions registration."""
+        responses.add(responses.POST, CHECK_URL, json=denied_registration_response(), status=200)
+
+        decision = shield.check("call from a denied agent", log=False)
+
+        assert decision.decision == "blocked"
+        assert decision.is_pending_registration is False
+
+    @responses.activate
+    def test_wrap_raises_blocked_error_carrying_pending_signal(self, shield, mocker):
+        """Block mode: wrap() raises ShieldBlockedError with requires_approval
+        and the mirrored property, so handlers can branch 'awaiting admin
+        approval' vs. 'policy blocked' without a second round-trip."""
+        responses.add(responses.POST, CHECK_URL, json=pending_registration_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        factory = mocker.Mock()
+        with pytest.raises(ShieldBlockedError) as exc_info:
+            shield.wrap(factory, "first call from a new agent")
+
+        factory.assert_not_called()
+        assert exc_info.value.requires_approval is True
+        assert exc_info.value.is_pending_registration is True
+
+    @responses.activate
+    def test_wrap_ordinary_block_is_not_pending(self, shield):
+        """A plain policy block through wrap() must not masquerade as a
+        pending registration."""
+        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        with pytest.raises(ShieldBlockedError) as exc_info:
+            shield.wrap(lambda: None, "bad prompt")
+
+        assert exc_info.value.requires_approval is False
+        assert exc_info.value.is_pending_registration is False
+
+    def test_property_is_read_only_on_decision(self):
+        d = self._decision("blocked", True)
+        with pytest.raises(FrozenInstanceError):
+            d.is_pending_registration = False  # type: ignore[misc]
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Canonical parity / contract test
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -906,7 +1144,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.2.0"
+    CANONICAL_VERSION = "0.3.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -924,6 +1162,7 @@ class TestCanonicalContract:
             "agent_id",
             "timeout",
             "block_on_escalated",
+            "credential_provider",
         }
 
     def test_constructor_params_are_keyword_only(self):
@@ -955,6 +1194,7 @@ class TestCanonicalContract:
         assert defaults["agent_id"] == "sdk-client"
         assert defaults["timeout"] == 10.0
         assert defaults["block_on_escalated"] is False
+        assert defaults["credential_provider"] is None
 
     def test_tenant_id_is_the_sole_hard_required_field(self):
         """tenant_id has no default; everything else does (env-fallback fields

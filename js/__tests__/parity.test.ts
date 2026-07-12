@@ -7,7 +7,7 @@
  * point of a canonical surface.
  *
  * This test pins the TypeScript side of the contract:
- *   1. The exported VERSION matches package.json AND the canonical 0.2.0.
+ *   1. The exported VERSION matches package.json AND the canonical 0.3.0.
  *   2. The User-Agent identifies the TS SDK + version (mirror of
  *      Python's `g8r-shield-python/{version}`).
  *   3. The /check and /log wire payloads carry EXACTLY the canonical field set.
@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { AgentShield, VERSION } from '../src/index';
 import { tenantId } from '../src/ids';
 
-const CANONICAL_VERSION = '0.2.0';
+const CANONICAL_VERSION = '0.3.0';
 
 // The exact governance field set the /check payload must carry (order-independent).
 const CANONICAL_CHECK_FIELDS = [
@@ -80,7 +80,7 @@ describe('canonical parity', () => {
     jest.restoreAllMocks();
   });
 
-  it('exports VERSION equal to the canonical 0.2.0', () => {
+  it('exports VERSION equal to the canonical 0.3.0', () => {
     expect(VERSION).toBe(CANONICAL_VERSION);
   });
 

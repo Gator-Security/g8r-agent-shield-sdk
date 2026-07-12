@@ -36,7 +36,7 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`).
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`).
 
 ```typescript
 // Minimal — consoleUrl + apiKey from env, everything else defaulted:
@@ -44,6 +44,52 @@ const result = await shield.wrap(
 //   export G8R_API_KEY=sk-shield-...
 const shield = new AgentShield({ tenantId: tenantId('acme-corp') });
 ```
+
+### Authenticating with short-lived credentials (`credentialProvider`)
+
+The Console accepts either the deployment **shared secret** or a **verified OIDC JWT** (workload identity — e.g. AWS) in the same `Authorization: Bearer` header. For JWTs — which expire — pass a `credentialProvider` instead of a static `apiKey`. The provider is awaited **fresh on every `/check` and `/log` request**, so a rotated token is always picked up:
+
+```typescript
+const shield = new AgentShield({
+  tenantId: tenantId('acme-corp'),
+  consoleUrl: 'https://shield.yourcompany.com',
+  // Mint/refresh the OIDC workload-identity JWT per request — sync or async.
+  credentialProvider: () => getWorkloadIdentityToken(),
+});
+```
+
+- `apiKey` and `credentialProvider` are **mutually exclusive** — the constructor throws if both are passed, and the `G8R_API_KEY` env fallback is not consulted when a provider is configured.
+- A provider **rejection on the policy check fails closed**: the SDK throws `ShieldConnectionError` (the provider's error is preserved on `.cause`), and `wrap()` never invokes the LLM factory. On the audit-log leg a provider failure is swallowed like any other logging failure — a logging outage never breaks the decision path (same contract as the Python SDK).
+- The resolved credential is used only for the `Authorization` header and is **never logged**.
+- With a verified JWT, the server trusts the JWT's **tenant claim** over the request body's `tenantId` — a mismatch returns HTTP `403`. A bad or missing credential returns `401`.
+
+### Agent registration (trust on first use)
+
+The **first** call from an unknown `agentId` auto-creates a **pending registration** in the Console's **Approvals queue**. What happens while it is pending depends on the server's pending-agent mode:
+
+- **`flag`** (server default) — calls from a pending agent evaluate normally under policy; admins get an alert. The SDK sees ordinary decisions.
+- **`block`** — calls return `decision: 'blocked'` with `requiresApproval: true` until an admin approves the agent.
+
+The SDK derives `isPendingRegistration` **client-side** from exactly that conjunction (`decision === 'blocked' && requiresApproval === true`) — it is **not** a wire field, and reason strings are never parsed:
+
+```typescript
+try {
+  const result = await shield.wrap(() => llmCall(), prompt);
+} catch (err) {
+  if (err instanceof ShieldBlockedError && err.isPendingRegistration) {
+    // Not a policy violation — the agent is awaiting approval in the
+    // Console's Approvals queue. Ask an admin to approve it, then retry.
+  }
+}
+
+// Or, without wrap():
+const result = await shield.check(prompt);
+if (result.isPendingRegistration) {
+  // Same signal on the raw decision object.
+}
+```
+
+An admin-**denied** agent returns `blocked` with `requiresApproval: false` in both modes, so `isPendingRegistration` stays unset for it — that block is a verdict, not a waiting room.
 
 ## API
 
@@ -140,6 +186,9 @@ interface PolicyCheckResult {
   reason: string;
   violatedRule: string | null;
   requiresApproval: boolean;
+  isPendingRegistration?: boolean; // Derived client-side (NOT a wire field):
+                                   // decision === 'blocked' && requiresApproval === true,
+                                   // i.e. the agent awaits approval in the Approvals queue
   complianceMappings: ComplianceMapping[];
   sessionRevoked?: boolean;
   redactedTokens?: string[];  // Tokens stripped by VPC masking layer
@@ -158,6 +207,8 @@ class ShieldBlockedError extends Error {
   violatedRule: string | null;
   complianceMappings: ComplianceMapping[];
   sessionRevoked: boolean;                 // true when a kill-switch policy fired
+  isPendingRegistration: boolean;          // true when the block is the trust-on-first-use
+                                           // registration gate, not a policy verdict
 }
 
 // Thrown on a non-2xx HTTP response from /check. The message exposes ONLY the
@@ -170,7 +221,9 @@ class ShieldConsoleError extends Error {
 }
 
 // Thrown when the Console is unreachable after the single retry. Names the
-// console URL; carries no response body.
+// console URL; carries no response body. Also thrown when a configured
+// credentialProvider rejects (fail closed — no request was sent); in that
+// case the provider's error is preserved on `.cause`.
 class ShieldConnectionError extends Error {
   consoleUrl: string;
 }
@@ -215,8 +268,10 @@ js/
 │   ├── ids.ts         # tenantId(), newRequestId() + TenantId / RequestId types
 │   └── logger.ts      # structured logger used internally
 ├── __tests__/
-│   ├── sdk.test.ts        # SDK client behavior + redaction integration
-│   └── redaction.test.ts  # all patterns + entropy detection
+│   ├── sdk.test.ts           # SDK client behavior + redaction integration
+│   ├── credentials.test.ts   # credentialProvider auth (per-request resolution, fail-closed)
+│   ├── registration.test.ts  # trust-on-first-use pending-registration detection
+│   └── redaction.test.ts     # all patterns + entropy detection
 ├── jest.config.js
 ├── package.json
 └── tsconfig.json

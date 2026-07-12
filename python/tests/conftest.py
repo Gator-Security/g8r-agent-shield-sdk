@@ -127,6 +127,33 @@ def escalated_response() -> dict:
     }
 
 
+def pending_registration_response() -> dict:
+    """v2 trust-on-first-use, server in block mode: the agent's registration
+    sits in the Console Approvals queue, so calls come back blocked WITH
+    requiresApproval — the conjunction that IS the pending signal."""
+    return {
+        "decision": "blocked",
+        "reason": "Agent registration pending approval in the Approvals queue.",
+        "violatedRule": None,
+        "requiresApproval": True,
+        "sessionRevoked": False,
+        "complianceMappings": [],
+    }
+
+
+def denied_registration_response() -> dict:
+    """v2 admin-DENIED agent: blocked withOUT requiresApproval (both server
+    modes) — must NOT read as pending."""
+    return {
+        "decision": "blocked",
+        "reason": "agent registration denied",
+        "violatedRule": None,
+        "requiresApproval": False,
+        "sessionRevoked": False,
+        "complianceMappings": [],
+    }
+
+
 def log_response() -> dict:
     return {
         "id": "log-entry-uuid-stub",
