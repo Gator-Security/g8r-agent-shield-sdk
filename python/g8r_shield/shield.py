@@ -65,6 +65,35 @@ class PolicyDecision:
     # Parity with the TypeScript SDK's `PolicyCheckResult.redactedTokens`.
     redacted_tokens: list[str] = field(default_factory=list)
 
+    @property
+    def is_pending_registration(self) -> bool:
+        """Whether this decision means "agent awaiting admin approval".
+
+        v2 Consoles register agents trust-on-first-use: the FIRST call from
+        an unknown ``agent_id`` auto-creates a pending registration in the
+        Console's Approvals queue. What the SDK observes next depends on the
+        server's pending-agent mode:
+
+        * **flag** (the server default) — calls from the pending agent
+          evaluate normally under policy while admins approve in the
+          background. The caller sees ordinary decisions; this property
+          stays False.
+        * **block** — calls from the pending agent return ``blocked`` with
+          ``requires_approval`` set until an admin approves it. On this
+          path ``wrap()`` raises :class:`ShieldBlockedError`, which carries
+          the same ``decision`` / ``requires_approval`` pair (and mirrors
+          this property), so integrators can distinguish "awaiting admin
+          approval in the Approvals queue" from "policy blocked".
+
+        On v2, ``decision == "blocked"`` together with ``requires_approval``
+        occurs ONLY for a pending registration in block mode — that
+        conjunction IS the pending signal. An admin-DENIED agent comes back
+        as ``blocked`` withOUT ``requires_approval``, so it correctly reads
+        False here. Branch on this property, never on the human-readable
+        ``reason`` string.
+        """
+        return self.decision == "blocked" and self.requires_approval
+
 
 @dataclass(frozen=True)
 class ShieldLogEntry:
@@ -81,8 +110,23 @@ class ShieldBlockedError(Exception):
         self.decision = decision.decision
         self.reason = decision.reason
         self.violated_rule = decision.violated_rule
+        # Carried so handlers can evaluate the v2 pending-registration signal
+        # (blocked + requires_approval) without re-fetching the decision —
+        # see `is_pending_registration` below.
+        self.requires_approval = decision.requires_approval
         self.session_revoked = decision.session_revoked
         self.compliance_mappings = decision.compliance_mappings
+
+    @property
+    def is_pending_registration(self) -> bool:
+        """Mirror of :attr:`PolicyDecision.is_pending_registration`.
+
+        True when this block means "agent awaiting admin approval in the
+        Console's Approvals queue" (v2 trust-on-first-use registration,
+        server in block mode) rather than a policy rejection. See the
+        :class:`PolicyDecision` property for the full contract.
+        """
+        return self.decision == "blocked" and self.requires_approval
 
 
 class ShieldConsoleError(RuntimeError):
@@ -152,9 +196,23 @@ class AgentShield:
         console_url: Base URL of your deployed G8R Console. Required in effect,
             but resolved from this argument OR the ``G8R_CONSOLE_URL`` env var;
             construction fails if neither is set. Never defaults to localhost.
-        api_key: Bearer token for the SDK check/log endpoints. Required in
-            effect, resolved from this argument OR the ``G8R_API_KEY`` env var;
-            construction fails if neither yields a non-empty value.
+        api_key: Bearer token for the SDK check/log endpoints — the STATIC
+            credential path (deployment shared secret). Required in effect
+            unless ``credential_provider`` is supplied; resolved from this
+            argument OR the ``G8R_API_KEY`` env var; construction fails if
+            neither yields a non-empty value. Mutually exclusive with
+            ``credential_provider``.
+        credential_provider: Zero-argument callable returning the Bearer
+            credential — the DYNAMIC path for short-lived tokens (e.g. an
+            OIDC JWT minted via AWS workload identity). Invoked fresh for
+            EVERY request (both ``/check`` and ``/log``) so a token that
+            expires mid-session never goes stale inside a long-lived
+            AgentShield instance. Mutually exclusive with an explicit
+            ``api_key`` (``ValueError`` if both are passed); when supplied,
+            the ``G8R_API_KEY`` env var is ignored. Provider failures raise
+            ``ShieldConnectionError`` on the check path — fail closed, the
+            wrapped LLM call never executes. The returned value is never
+            logged.
         department: Functional department (e.g. 'Legal', 'Finance').
         user_id: Identifier of the end-user initiating the action.
         employee_name: Human-readable name for audit trail.
@@ -171,6 +229,7 @@ class AgentShield:
     __slots__ = (
         "_console_url",
         "_api_key",
+        "_credential_provider",
         "_tenant_id",
         "_department",
         "_user_id",
@@ -194,6 +253,7 @@ class AgentShield:
         agent_id: str = "sdk-client",
         timeout: float = 10.0,
         block_on_escalated: bool = False,
+        credential_provider: Callable[[], str] | None = None,
     ) -> None:
         if not _HAS_REQUESTS:
             raise ImportError(
@@ -212,11 +272,28 @@ class AgentShield:
                 "127.0.0.1 in the runtime environment."
             )
         self._console_url = resolved_url.rstrip("/")
-        self._api_key = api_key or os.environ.get("G8R_API_KEY") or ""
-        if not self._api_key:
+
+        if credential_provider is not None and api_key is not None:
+            # Two explicit credential sources is a config bug, not a
+            # preference to guess at. Fail fast rather than silently
+            # picking one and leaving the other dead.
             raise ValueError(
-                "G8R API key is required. Pass api_key=... or set the G8R_API_KEY env var."
+                "api_key and credential_provider are mutually exclusive. "
+                "Pass the static shared secret OR a provider callable, not both."
             )
+        self._credential_provider = credential_provider
+        if credential_provider is not None:
+            # Dynamic path: the provider is the sole credential source. The
+            # G8R_API_KEY env var is deliberately NOT consulted — a stale
+            # secret left in the deployment environment must never shadow
+            # the short-lived tokens the caller opted into.
+            self._api_key = ""
+        else:
+            self._api_key = api_key or os.environ.get("G8R_API_KEY") or ""
+            if not self._api_key:
+                raise ValueError(
+                    "G8R API key is required. Pass api_key=... or set the G8R_API_KEY env var."
+                )
 
         self._tenant_id = tenant_id
         self._department = department
@@ -362,6 +439,33 @@ class AgentShield:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    def _bearer_credential(self) -> str:
+        """Resolve the Bearer value for ONE outbound request.
+
+        Static path: the api_key resolved at construction. Dynamic path: the
+        credential_provider is invoked fresh on every call — never cached —
+        so short-lived tokens (OIDC JWTs from AWS workload identity) stay
+        valid across a long-lived AgentShield instance.
+
+        A provider failure is wrapped in :class:`ShieldConnectionError`
+        rather than surfaced raw: like a connection failure, the request
+        never completed and there is no server response to carry — and on
+        the check path the caller fails CLOSED (the wrapped LLM call never
+        runs) instead of proceeding unevaluated. The provider's exception is
+        chained as ``__cause__``; its message is deliberately kept out of
+        ours, and the returned credential is never logged.
+        """
+        if self._credential_provider is None:
+            return self._api_key
+        try:
+            return self._credential_provider()
+        except Exception as exc:
+            raise ShieldConnectionError(
+                "[G8R Shield] credential_provider raised while resolving the "
+                "Bearer credential; failing closed. See __cause__ for the "
+                "underlying error."
+            ) from exc
+
     def _evaluate(self, prompt: str, request_id: str | None = None) -> PolicyDecision:
         # `request_id` is generated per-call by default. `wrap()` passes its
         # own value so /check and /log share a single correlation id.
@@ -380,8 +484,15 @@ class AgentShield:
         # invariant in value type), so we declare the literal at the
         # widened type. Pre-existing fix surfaced when CI bumped mypy
         # from 1.19 → 2.1.0 and requests stubs from 2.32 → 2.34.
+        #
+        # The credential is resolved once per REQUEST (before the retry
+        # loop): the retry re-sends the same request, and a provider
+        # failure is a local credential problem — retrying the provider
+        # here would just mask misconfiguration. _bearer_credential
+        # raises ShieldConnectionError itself on provider failure, so
+        # the check path fails closed before anything goes on the wire.
         headers: dict[str, str | bytes] = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {self._bearer_credential()}",
             "Content-Type": "application/json",
             "User-Agent": _SDK_USER_AGENT,
         }
@@ -478,13 +589,6 @@ class AgentShield:
         if request_id is None:
             request_id = str(uuid.uuid4())
         url = f"{self._console_url}/api/sdk/v1/log"
-        # See `check()` for the rationale on the `dict[str, str | bytes]`
-        # annotation.
-        headers: dict[str, str | bytes] = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": _SDK_USER_AGENT,
-        }
         # Redact before the audit-log POST too: the raw prompt with secrets
         # must never leave the process via ANY endpoint — /check or /log.
         payload: dict[str, Any] = {
@@ -512,6 +616,17 @@ class AgentShield:
         }
 
         try:
+            # Header construction lives INSIDE the try: resolving the
+            # credential can raise (a credential_provider failure surfaces
+            # as ShieldConnectionError), and on the audit-log path that is
+            # a logging failure like any other — warned below, never
+            # raised. See `_evaluate` for the rationale on the
+            # `dict[str, str | bytes]` annotation.
+            headers: dict[str, str | bytes] = {
+                "Authorization": f"Bearer {self._bearer_credential()}",
+                "Content-Type": "application/json",
+                "User-Agent": _SDK_USER_AGENT,
+            }
             response = requests.post(url, json=payload, headers=headers, timeout=self._timeout)
             response.raise_for_status()
             data = response.json()
