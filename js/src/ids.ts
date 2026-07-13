@@ -42,3 +42,18 @@ export function newRequestId(): RequestId {
   // Fallback: timestamp + Math.random (best-effort, not crypto-strong).
   return `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}` as RequestId;
 }
+
+/**
+ * Generate a fresh session ID — the stable id for one logical agent run,
+ * propagated across nested and multi-turn calls (see the sub-agent lineage
+ * feature). Deliberately a plain (unbranded) string to match the wire
+ * contract's `sessionId: string`, so callers can supply their own id with no
+ * casting. Prefers crypto.randomUUID, mirroring newRequestId.
+ */
+export function newSessionId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  // Fallback: timestamp + Math.random (best-effort, not crypto-strong).
+  return `sess-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}

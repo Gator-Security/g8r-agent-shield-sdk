@@ -89,6 +89,7 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 | `employee_name`      | `str \| None`   | No       | `None` (falls back to `user_id` in logs)    | Display name for audit trail             |
 | `ai_model`           | `str`           | No       | `"unknown"`                                 | AI model being called                    |
 | `agent_id`           | `str`           | No       | `"sdk-client"`                              | Agent identifier (matches TS SDK default) |
+| `session_id`         | `str \| None`   | No       | `None`                                      | Per-instance default governance session grouping this instance's calls into one run. Overridden by an enclosing `run()` scope or a propagated nested context. See [Sub-agent lineage](#sub-agent-lineage) |
 | `timeout`            | `float`         | No       | `10.0`                                      | HTTP request timeout in seconds          |
 | `block_on_escalated` | `bool`          | No       | `False`                                     | When `True`, `wrap()` raises `ShieldBlockedError` on escalated decisions instead of proceeding with a warning (fail-closed) |
 
@@ -106,6 +107,15 @@ Evaluate a prompt and conditionally execute the LLM call. The interaction is log
 - `prompt` — The text to evaluate.
 - Raises `ShieldBlockedError` when the policy decision is `blocked`.
 - Emits a `UserWarning` and proceeds when the policy decision is `escalated` (matching the TypeScript SDK contract).
+- Propagates governance lineage automatically — see [Sub-agent lineage](#sub-agent-lineage).
+
+### `shield.run(session_id: str | None = None)`
+
+Context manager that groups a block of calls under one governance session (minting one if `session_id` is omitted, or adopting an active/instance session). Yields the session id and restores the previous ambient context on exit, even on exception. See [Sub-agent lineage](#sub-agent-lineage).
+
+### `shield.child(agent_id: str)`
+
+Context manager that manually appends `agent_id` as a parent hop for its block — for nesting a child agent **outside** a wrapped factory. `wrap()` already handles the common case automatically.
 
 ### `PolicyDecision`
 
@@ -225,6 +235,55 @@ except ShieldBlockedError as err:
 ```
 
 An agent an admin has *denied* comes back `blocked` **without** `requires_approval` (in both modes), so it correctly reads as a policy block, not a pending one.
+
+## Sub-agent lineage
+
+When one governed agent spawns another, the child call should be governed *with awareness of the chain above it* — otherwise a nested agent could sidestep the policy that gated its parent. `wrap()` propagates that lineage **automatically**: no manual instrumentation, and no change to existing single-agent code.
+
+Every `wrap()` reads the ambient governance context, governs the call under it, and then runs the factory inside a scope that appends its own `agent_id`. Any `wrap()` or `check()` nested inside the factory inherits the **same session** and this agent as its **immediate parent**:
+
+```python
+root  = AgentShield(tenant_id="acme", console_url=URL, api_key=KEY, agent_id="orchestrator")
+child = AgentShield(tenant_id="acme", console_url=URL, api_key=KEY, agent_id="researcher")
+
+# A top-level wrap() mints a fresh session and has no ancestors.
+root.wrap(
+    lambda: child.wrap(              # nested inside root's factory...
+        lambda: call_llm(prompt),    # ...governed as a child of "orchestrator"
+        prompt,
+    ),
+    plan_prompt,
+)
+```
+
+Here the inner call is evaluated with `parentAgents == ["orchestrator"]` under the **same** `sessionId` as the outer one — governed with full chain awareness. Two levels deep, a leaf sees `["orchestrator", "researcher"]` (root-first, immediate-parent last).
+
+### Grouping calls into a run — `run()`
+
+To thread one session across calls that aren't nested through a factory (e.g. multi-turn, or a series of `check()`s), open a `run()` scope:
+
+```python
+with shield.run() as session_id:      # mints a session (or pass session_id=...)
+    shield.check("step one")
+    shield.wrap(lambda: call_llm(p), p)   # same session_id
+```
+
+`run()` establishes (or adopts) a session for the block and restores the previous context on exit — even on exception. Nesting `run()` never splits a session. A per-instance default is also available: `AgentShield(..., session_id="...")`.
+
+For nesting **outside** a wrapped factory, `shield.child(agent_id="planner")` is a context manager that manually appends a parent hop for its block.
+
+### Wire fields
+
+Two **optional, additive** fields are sent on both `/api/sdk/v1/check` and `/api/sdk/v1/log`:
+
+| Field          | Type       | Meaning                                                                                 |
+| -------------- | ---------- | --------------------------------------------------------------------------------------- |
+| `sessionId`    | `string`   | Stable id for one logical agent run, propagated across nested and multi-turn calls      |
+| `parentAgents` | `string[]` | Ancestor agent-id chain, ordered **root-first, immediate-parent last**; absent at the top level |
+
+Both are **omitted** when no run or nesting is in effect, so un-instrumented code sends exactly the payload it did before — fully backward-compatible. Lineage is **sent, never used to decide**.
+
+> **Trust model.** This lineage is **advisory** — both the session id and the parent chain are *self-asserted* by the SDK caller, and the Console records them as reported. Attestation-bound signing (so a child cannot forge or drop its ancestry) is a **future** addition; the wire fields are additive precisely so that upgrade stays backward-compatible.
 
 ## AWS Bedrock example
 
