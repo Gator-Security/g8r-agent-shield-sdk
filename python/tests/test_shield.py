@@ -15,6 +15,9 @@ Covers:
                         exclusion with api_key, fail-closed provider errors
 - is_pending_registration — v2 pending-registration truth table on
                             PolicyDecision and ShieldBlockedError
+- sub-agent lineage — ambient session + parent-agent chain propagation through
+                      wrap()/run()/child(); back-compat when unused; contextvars
+                      isolation across async tasks
 """
 
 from __future__ import annotations
@@ -121,6 +124,7 @@ class TestConstruction:
             "_employee_name",
             "_ai_model",
             "_agent_id",
+            "_session_id",
             "_timeout",
             "_block_on_escalated",
         }
@@ -1144,7 +1148,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.3.0"
+    CANONICAL_VERSION = "0.4.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1160,6 +1164,7 @@ class TestCanonicalContract:
             "employee_name",
             "ai_model",
             "agent_id",
+            "session_id",
             "timeout",
             "block_on_escalated",
             "credential_provider",
@@ -1192,6 +1197,7 @@ class TestCanonicalContract:
         assert defaults["employee_name"] is None
         assert defaults["ai_model"] == "unknown"
         assert defaults["agent_id"] == "sdk-client"
+        assert defaults["session_id"] is None
         assert defaults["timeout"] == 10.0
         assert defaults["block_on_escalated"] is False
         assert defaults["credential_provider"] is None
@@ -1252,8 +1258,8 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.2.0 so 'are these in parity?' is a
-        version-equality check in CI."""
+        """Both SDKs land on the SAME 0.4.0 (lockstep) so 'are these in
+        parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 
     def test_user_agent_reflects_canonical_version(self):
@@ -1271,3 +1277,316 @@ class TestCanonicalContract:
         )
         assert "sk-super-secret-abc123" not in repr(s)
         assert "api_key" not in repr(s)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Sub-agent lineage — ambient session + parent-agent chain propagation
+# ════════════════════════════════════════════════════════════════════════════
+#
+# The wire contract adds two OPTIONAL, additive fields to /check and /log:
+#   - sessionId: str        — stable id for a logical agent run
+#   - parentAgents: str[]   — ancestor agent-id chain, ROOT-first, absent at top
+# Both are SENT, never used to decide. Absent/empty when no run or nesting is in
+# effect, so un-instrumented code behaves exactly as before this feature.
+
+
+def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
+    """Build a shield against the mock console with a given agent_id."""
+    return AgentShield(
+        tenant_id="tenant-test",
+        console_url=CONSOLE_URL,
+        api_key="sk-shield-test-key",
+        agent_id=agent_id,
+        **kwargs,
+    )
+
+
+def _check_bodies() -> list[dict]:
+    """Parsed request bodies of every /check call, in order."""
+    return [json.loads(c.request.body) for c in responses.calls if c.request.url == CHECK_URL]
+
+
+class TestLineageTopLevel:
+    @responses.activate
+    def test_top_level_wrap_sends_session_and_empty_parents(self, shield):
+        """A top-level wrap() mints a fresh sessionId (threaded to /check AND
+        /log) and sends NO ancestors — the canonical top-of-tree wire shape."""
+        import uuid as _uuid
+
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.wrap(lambda: "ok", "prompt")
+
+        check_body = json.loads(responses.calls[0].request.body)
+        log_body = json.loads(responses.calls[1].request.body)
+
+        assert "sessionId" in check_body
+        _uuid.UUID(check_body["sessionId"])  # well-formed uuid4 (raises otherwise)
+        # Same session on both legs so the Console can stitch the run together.
+        assert check_body["sessionId"] == log_body["sessionId"]
+        # No ancestors at the top level (absent on the wire).
+        assert check_body.get("parentAgents", []) == []
+        assert log_body.get("parentAgents", []) == []
+
+    @responses.activate
+    def test_lone_check_omits_lineage_fields(self, shield):
+        """Back-compat: a lone check() with no run/nesting and no instance
+        session sends NEITHER field — byte-for-byte the pre-lineage payload."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.check("prompt")
+
+        check_body = json.loads(responses.calls[0].request.body)
+        log_body = json.loads(responses.calls[1].request.body)
+        for body in (check_body, log_body):
+            assert "sessionId" not in body
+            assert "parentAgents" not in body
+
+    @responses.activate
+    def test_instance_session_id_used_by_lone_check(self):
+        """A per-instance session_id default is sent by a standalone check(),
+        even without a run() scope — still no parentAgents (no nesting)."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        s = _lineage_shield(session_id="run-inst-1")
+
+        s.check("prompt", log=False)
+
+        body = json.loads(responses.calls[0].request.body)
+        assert body["sessionId"] == "run-inst-1"
+        assert "parentAgents" not in body
+
+    @responses.activate
+    def test_ambient_session_beats_instance_default(self):
+        """When both are set, an active run() session wins over the instance
+        default (ambient precedence)."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        s = _lineage_shield(session_id="inst-default")
+
+        with s.run(session_id="ambient-win"):
+            s.check("prompt", log=False)
+
+        body = json.loads(responses.calls[0].request.body)
+        assert body["sessionId"] == "ambient-win"
+
+
+class TestLineageNested:
+    @responses.activate
+    def test_nested_wrap_inherits_session_and_reports_parent(self):
+        """A wrap() nested inside a parent wrap()'s factory sends the SAME
+        session and parentAgents == [parent_agent_id]."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        parent = _lineage_shield(agent_id="parent-agent")
+        child = _lineage_shield(agent_id="child-agent")
+
+        result = parent.wrap(
+            lambda: child.wrap(lambda: "child-ok", "child prompt"),
+            "parent prompt",
+        )
+        assert result == "child-ok"
+
+        # /check calls in order: parent, then child (nested inside the factory).
+        parent_check, child_check = _check_bodies()
+        child_log = json.loads(responses.calls[3].request.body)
+
+        assert child_check["sessionId"] == parent_check["sessionId"]  # same run
+        assert child_check["parentAgents"] == ["parent-agent"]  # sole ancestor
+        assert child_log["parentAgents"] == ["parent-agent"]  # also on /log
+        assert parent_check.get("parentAgents", []) == []  # parent had none
+
+    @responses.activate
+    def test_two_levels_deep_chain_is_root_first(self):
+        """root -> mid -> leaf: the leaf sends parentAgents == [root, mid]
+        (root-first, immediate-parent last); all three share one session."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        root = _lineage_shield(agent_id="root")
+        mid = _lineage_shield(agent_id="mid")
+        leaf = _lineage_shield(agent_id="leaf")
+
+        root.wrap(
+            lambda: mid.wrap(
+                lambda: leaf.wrap(lambda: "leaf-ok", "leaf prompt"),
+                "mid prompt",
+            ),
+            "root prompt",
+        )
+
+        root_check, mid_check, leaf_check = _check_bodies()
+        assert mid_check["parentAgents"] == ["root"]
+        assert leaf_check["parentAgents"] == ["root", "mid"]
+        assert mid_check["sessionId"] == root_check["sessionId"]
+        assert leaf_check["sessionId"] == root_check["sessionId"]
+
+    @responses.activate
+    def test_escalated_proceed_path_also_nests_lineage(self):
+        """The escalated-but-proceed path runs factory() inside the extended
+        scope too, so a call nested under an escalated action still inherits the
+        chain."""
+        responses.add(responses.POST, CHECK_URL, json=escalated_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        parent = _lineage_shield(agent_id="esc-parent")
+        child = _lineage_shield(agent_id="esc-child")
+
+        # Default block_on_escalated=False → escalated proceeds and runs factory.
+        parent.wrap(lambda: child.check("nested", log=False), "destructive")
+
+        # The nested child /check is the last one recorded.
+        assert _check_bodies()[-1]["parentAgents"] == ["esc-parent"]
+
+
+class TestLineageRunScope:
+    @responses.activate
+    def test_run_groups_calls_under_one_session(self, shield):
+        """Calls inside a run() block share one ambient session — without any
+        wrap(). run() establishes a session, not a parent hop."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with shield.run() as session_id:
+            shield.check("one", log=False)
+            shield.check("two", log=False)
+
+        one, two = _check_bodies()
+        assert one["sessionId"] == session_id
+        assert two["sessionId"] == session_id
+        assert "parentAgents" not in one
+
+    @responses.activate
+    def test_run_accepts_explicit_session_id(self, shield):
+        """An explicit run(session_id=...) is used verbatim and yielded."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with shield.run(session_id="run-fixed-42") as sid:
+            assert sid == "run-fixed-42"
+            shield.check("x", log=False)
+
+        assert _check_bodies()[0]["sessionId"] == "run-fixed-42"
+
+    @responses.activate
+    def test_wrap_inside_run_adopts_run_session(self, shield):
+        """A wrap() inside a run() adopts the run's session rather than minting
+        a fresh one — multi-turn calls stay under one run id."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        with shield.run(session_id="grp-1"):
+            shield.wrap(lambda: "ok", "prompt")
+
+        assert _check_bodies()[0]["sessionId"] == "grp-1"
+
+    @responses.activate
+    def test_nested_run_does_not_split_session(self, shield):
+        """An inner run() with no explicit id adopts the outer run's session."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with shield.run() as outer, shield.run() as inner:
+            assert inner == outer
+            shield.check("x", log=False)
+
+        assert _check_bodies()[0]["sessionId"] == outer
+
+
+class TestLineageChild:
+    @responses.activate
+    def test_child_pushes_manual_parent_hop(self, shield):
+        """child(agent_id=...) declares a manual parent hop: calls inside see
+        that agent as their sole ancestor, under a minted session."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with shield.child(agent_id="planner"):
+            shield.check("x", log=False)
+
+        body = _check_bodies()[0]
+        assert body["parentAgents"] == ["planner"]
+        assert "sessionId" in body  # a session is minted to carry the hop
+
+    @responses.activate
+    def test_child_hops_stack_root_first(self, shield):
+        """Stacked child() scopes accumulate root-first, immediate-parent last."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        with shield.child(agent_id="root"), shield.child(agent_id="mid"):
+            shield.check("x", log=False)
+
+        assert _check_bodies()[0]["parentAgents"] == ["root", "mid"]
+
+
+class TestLineageContextRestoration:
+    @responses.activate
+    def test_context_restored_after_allowed_wrap(self, shield):
+        """After a top-level wrap(), the ambient context is back to empty — a
+        subsequent lone check() inherits neither session nor chain."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.wrap(lambda: "ok", "prompt")
+        shield.check("after", log=False)
+
+        after = _check_bodies()[-1]
+        assert "sessionId" not in after
+        assert "parentAgents" not in after
+
+    @responses.activate
+    def test_context_restored_after_denied_wrap(self, shield):
+        """Even when wrap() denies (raises), the eval-time context pin is
+        unwound — a follow-up check() sends no lineage."""
+        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        with pytest.raises(ShieldBlockedError):
+            shield.wrap(lambda: None, "bad prompt")
+
+        # A blocked check() does not raise; reuse it to inspect the payload.
+        shield.check("after", log=False)
+        after = _check_bodies()[-1]
+        assert "sessionId" not in after
+        assert "parentAgents" not in after
+
+    @responses.activate
+    def test_context_restored_when_factory_raises(self, shield):
+        """If factory() raises, the nested scope is still unwound (finally)."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        def boom():
+            raise ValueError("kaboom")
+
+        with pytest.raises(ValueError, match="kaboom"):
+            shield.wrap(boom, "prompt")
+
+        shield.check("after", log=False)
+        assert "sessionId" not in _check_bodies()[-1]
+
+
+class TestLineageAsyncIsolation:
+    @responses.activate
+    def test_contextvars_isolate_across_async_tasks(self, shield):
+        """Two concurrent asyncio tasks each open their own run() session; the
+        ambient session must not leak between them. contextvars are task-local,
+        so the SDK is safe under async fan-out even though its transport is
+        synchronous (`requests`)."""
+        import asyncio
+
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        async def one(tag: str) -> tuple[str, str]:
+            with shield.run(session_id=f"sess-{tag}"):
+                # Yield so the tasks interleave between establishing the session
+                # and using it; a shared ambient would cross the sessions here.
+                await asyncio.sleep(0)
+                shield.check("p", log=False)
+                # No await between check() and this read, so calls[-1] is ours.
+                sent = json.loads(responses.calls[-1].request.body)["sessionId"]
+                return tag, sent
+
+        async def main() -> dict[str, str]:
+            return dict(await asyncio.gather(one("A"), one("B")))
+
+        results = asyncio.run(main())
+        assert results["A"] == "sess-A"  # each task kept its own session
+        assert results["B"] == "sess-B"

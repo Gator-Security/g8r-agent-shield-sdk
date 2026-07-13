@@ -36,7 +36,7 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`).
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default — a per-instance default [session](#sub-agent-lineage) that, when omitted, means `wrap()` mints a fresh session per top-level call and a bare `check()` sends none (backward-compatible).
 
 ```typescript
 // Minimal — consoleUrl + apiKey from env, everything else defaulted:
@@ -102,7 +102,7 @@ The primary integration point. Runs the full pipeline:
 3. **Log** — POST audit entry to `/api/sdk/v1/log`
 4. **Invoke** — call `factory()` only if decision is `allowed`, or `escalated` while `blockOnEscalated` is `false`
 
-If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` reuses `check(prompt, { requestId, log: false })` and then logs once with the same `requestId`, so `/check` and `/log` correlate under a single id with no duplicate audit entry.
+If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` runs the `/check` evaluation and then a single `/log`, both under one `requestId` and one resolved [lineage](#sub-agent-lineage), so `/check` and `/log` correlate under a single id with no duplicate audit entry. When allowed (or escalated-and-proceeding), the factory runs inside an ambient scope so nested `wrap()` calls inherit the session and parent-agent chain automatically.
 
 ```typescript
 try {
@@ -135,6 +135,19 @@ const result2 = await shield.check(prompt, {
 
 On a non-2xx response, `check()` throws a typed **`ShieldConsoleError`** (its message exposes only the status code — the raw body is on `.detail`). On a transient connection failure it retries once, then throws **`ShieldConnectionError`**.
 
+### `shield.run(fn, opts?)`
+
+Establishes an ambient governance **session** for the duration of `fn`, so every `wrap()`/`check()` call made inside it — across `await`s and nested agents — shares one `sessionId` with no manual threading. Use it to group a multi-turn conversation or a fan-out of tool calls that belong to **one logical run**. Returns whatever `fn` returns (await it if `fn` is async). See [Sub-agent lineage](#sub-agent-lineage).
+
+```typescript
+await shield.run(async () => {
+  await shield.wrap(() => turn1(), prompt1);
+  await shield.wrap(() => turn2(), prompt2); // same sessionId as turn1
+}, { sessionId: 'conversation-abc' }); // sessionId optional — minted if omitted
+```
+
+The session resolves as: explicit `opts.sessionId` → the ambient session already in scope → the instance's configured `sessionId` → a freshly minted one. Any ancestor agent chain already in scope is preserved (`run()` groups calls under a session; `wrap()` is what extends the chain). The prior context is restored when `fn` returns or throws.
+
 ### `redactSensitiveData(input)`
 
 Standalone redaction — can be used independently of the shield client.
@@ -144,6 +157,60 @@ import { redactSensitiveData } from '@g8r-security/agent-shield-sdk';
 
 const { redacted, tokensReplaced } = redactSensitiveData(input);
 ```
+
+## Sub-agent lineage
+
+When an agent governed by the SDK spawns **sub-agents** that are themselves governed, each hop should be evaluated with awareness of the run it belongs to and the agents that led to it. The SDK propagates that **lineage automatically** through nested `wrap()` calls — no manual instrumentation at each call site — by adding two optional, additive fields to the `/check` and `/log` wire payloads:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sessionId` | `string` | Stable id for one logical agent run, propagated across nested **and** multi-turn calls. |
+| `parentAgents` | `string[]` | Ancestor agent-id chain, **root-first, immediate-parent last**. Absent for a top-level call. |
+
+### How propagation works
+
+`wrap()` maintains an ambient governance context (backed by Node's `AsyncLocalStorage`). For each call it:
+
+1. Resolves the **session** — the ambient session in scope, else this instance's configured `sessionId`, else a freshly minted one (`crypto.randomUUID`). A top-level call therefore mints a fresh session; a nested call inherits its parent's.
+2. Resolves the **parent chain** — the ancestor chain in scope (empty at the top).
+3. Sends both on `/check` and `/log`.
+4. Runs the factory **inside an extended scope** whose chain now ends with this agent, so any `wrap()` the factory makes — directly or in an awaited continuation — inherits the same session and the extended chain. The prior context auto-restores when the call returns, including on a block/throw.
+
+```typescript
+const orchestrator = new AgentShield({ ...cfg, agentId: 'orchestrator' });
+const researcher   = new AgentShield({ ...cfg, agentId: 'researcher' });
+
+await orchestrator.wrap(async () => {
+  // This nested call is governed with lineage automatically:
+  //   sessionId    → the SAME session as the orchestrator call
+  //   parentAgents → ['orchestrator']   (root-first)
+  await researcher.wrap(() => llm(), 'research the filing');
+  return synthesize();
+}, 'produce the report');
+```
+
+Two levels deep, the innermost call sends `parentAgents: ['orchestrator', 'researcher']`. Because the context is backed by `AsyncLocalStorage`, concurrent agent runs stay isolated — interleaved chains never observe each other's session or lineage.
+
+### Grouping a run explicitly
+
+Use [`shield.run(fn, { sessionId? })`](#shieldrunfn-opts) to bind a session across calls that aren't nested inside one `wrap()` — e.g. the turns of a conversation, or a fan-out of sibling tool calls:
+
+```typescript
+await shield.run(async () => {
+  await shield.wrap(() => turnOne(), promptOne);
+  await shield.wrap(() => turnTwo(), promptTwo); // shares turnOne's sessionId
+});
+```
+
+`wrap()` itself is the **child-agent helper**: nesting a `wrap()` (from any shield instance, including a distinct sub-agent identity) inside another `wrap()`'s factory is all it takes to extend the chain — the sub-agent's `agentId` is appended automatically.
+
+### Trust model — advisory, self-asserted
+
+Lineage is **advisory / self-asserted**: the `sessionId` and `parentAgents` a client sends are metadata it vouches for, not cryptographically proven identity. The governance plane uses them for correlation, chain-aware policy, and audit — it **never** lets them relax a decision, and neither does the SDK (lineage is sent, but the local enforcement path is unchanged). Attestation-bound signing of the chain (so a hop's ancestry can be *verified*, not merely asserted) is a planned future capability; until then, treat lineage as trustworthy only to the extent you trust the agents populating it.
+
+### Backward compatibility & environment support
+
+The fields are **omitted entirely** when not meaningful: a plain, un-nested `check()` with no configured/ambient session sends neither, so existing integrations are byte-for-byte unchanged. On runtimes where `AsyncLocalStorage` cannot be loaded (browsers, some bundles) the SDK degrades to a single module-level context: synchronous nesting still propagates and the scope still restores, but concurrent async chains are **not** isolated. Prefer a Node runtime for lineage-critical multi-tenant workloads.
 
 ## Redaction Layer
 
@@ -265,10 +332,12 @@ js/
 ├── src/
 │   ├── index.ts       # AgentShield class, ShieldBlockedError, PolicyCheckResult, ShieldLogEntry
 │   ├── redaction.ts   # redactSensitiveData() — local-first masking layer
-│   ├── ids.ts         # tenantId(), newRequestId() + TenantId / RequestId types
+│   ├── context.ts     # ambient governance context (session + parent-agent chain) via AsyncLocalStorage
+│   ├── ids.ts         # tenantId(), newRequestId(), newSessionId() + TenantId / RequestId types
 │   └── logger.ts      # structured logger used internally
 ├── __tests__/
 │   ├── sdk.test.ts           # SDK client behavior + redaction integration
+│   ├── lineage.test.ts       # sub-agent lineage propagation + async isolation
 │   ├── credentials.test.ts   # credentialProvider auth (per-request resolution, fail-closed)
 │   ├── registration.test.ts  # trust-on-first-use pending-registration detection
 │   └── redaction.test.ts     # all patterns + entropy detection

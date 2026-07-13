@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -42,6 +43,110 @@ _SDK_USER_AGENT = f"g8r-shield-python/{_SDK_VERSION}"
 # Single-retry backoff for transient network errors in _evaluate. Kept short
 # so it doesn't add user-visible latency on the happy path or on hard failures.
 _RETRY_BACKOFF_SECONDS = 0.5
+
+
+# ── Ambient governance context (sub-agent lineage) ──────────────────────────
+# Lineage — the session a call belongs to, plus the chain of agents above it —
+# is propagated IMPLICITLY through nested agent calls via `contextvars`, so
+# every hop is governed with chain awareness without the caller threading
+# anything by hand. `wrap()` reads the ambient context, then extends it around
+# the wrapped factory; anything that nests a further g8r_shield call inside
+# inherits the extended chain and the same session.
+#
+# Trust model: this lineage is ADVISORY. Both the session id and the parent
+# chain are SELF-ASSERTED by the caller — the Console records them as reported,
+# it does not cryptographically verify them. Attestation-bound signing (so a
+# child cannot forge or drop its ancestry) is a FUTURE addition; the two wire
+# fields are deliberately additive + optional so that upgrade stays
+# backward-compatible.
+
+
+@dataclass(frozen=True)
+class _GovernanceContext:
+    """The lineage carried alongside a governed call.
+
+    ``session_id`` — a stable id for one logical agent run, threaded across
+    nested and multi-turn calls so the Console can stitch a run together.
+    ``None`` until a run is established (a top-level ``wrap()``, an explicit
+    ``AgentShield.run()`` scope, or a per-instance ``session_id`` default).
+
+    ``agent_chain`` — the ancestor agent-id chain, ordered ROOT-FIRST with the
+    IMMEDIATE PARENT LAST. Empty at the top level. Each ``wrap()`` appends its
+    own ``agent_id`` before invoking the wrapped factory, so anything nested
+    inside inherits the extended chain.
+
+    Frozen and immutable: propagation only ever REPLACES the ambient value
+    (via a `contextvars` token), never mutates it in place — so the single
+    shared default instance below is safe.
+    """
+
+    session_id: str | None = None
+    agent_chain: tuple[str, ...] = ()
+
+
+# Process-wide ambient context. `contextvars` gives the isolation we need for
+# free: each asyncio task and each fresh thread sees its own value, so
+# concurrent agent runs never bleed lineage into one another. The default is
+# the EMPTY context — an un-instrumented call behaves exactly as it did before
+# this feature existed (no session, no parent chain on the wire).
+_AMBIENT_CONTEXT: ContextVar[_GovernanceContext] = ContextVar(
+    # B039 warns against mutable ContextVar defaults (a value shared across
+    # contexts that one context could mutate for all). It does not apply here:
+    # `_GovernanceContext` is a FROZEN dataclass, so the shared empty default is
+    # immutable and read-only — propagation only ever REPLACES it via a token,
+    # never mutates it — which is exactly the safe pattern B039 is protecting.
+    "g8r_shield_governance_context",
+    default=_GovernanceContext(),  # noqa: B039
+)
+
+
+class _RunScope:
+    """Context manager that establishes an ambient governance scope for a block.
+
+    Backs both :meth:`AgentShield.run` (group calls under one session) and
+    :meth:`AgentShield.child` (declare a manual parent hop). Resolution happens
+    on ENTER — reading the ambient context at the moment the block starts — and
+    the previous ambient value is restored on EXIT via a `contextvars` token,
+    so it is exception-safe and never leaks past the ``with`` block. A fresh
+    scope is constructed per ``run()`` / ``child()`` call, so re-use is a
+    non-issue.
+    """
+
+    __slots__ = ("_explicit_session", "_instance_session", "_push_agent", "_token")
+
+    def __init__(
+        self,
+        *,
+        explicit_session: str | None,
+        instance_session: str | None,
+        push_agent: str | None = None,
+    ) -> None:
+        self._explicit_session = explicit_session
+        self._instance_session = instance_session
+        self._push_agent = push_agent
+        self._token: Token[_GovernanceContext] | None = None
+
+    def __enter__(self) -> str:
+        ctx = _AMBIENT_CONTEXT.get()
+        # Session precedence: an explicit argument wins, then an active ambient
+        # run is adopted (so nesting never splits a run), then the instance
+        # default, then a freshly minted uuid4.
+        session = (
+            self._explicit_session or ctx.session_id or self._instance_session or str(uuid.uuid4())
+        )
+        # child() appends a parent hop; run() leaves the chain untouched.
+        chain = ctx.agent_chain + (self._push_agent,) if self._push_agent else ctx.agent_chain
+        self._token = _AMBIENT_CONTEXT.set(
+            _GovernanceContext(session_id=session, agent_chain=chain)
+        )
+        return session
+
+    def __exit__(self, *exc_info: object) -> None:
+        # Restore the caller's ambient context. Guard against a double-exit
+        # leaving a dangling token.
+        if self._token is not None:
+            _AMBIENT_CONTEXT.reset(self._token)
+            self._token = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +323,14 @@ class AgentShield:
         employee_name: Human-readable name for audit trail.
         ai_model: Model identifier (e.g. 'anthropic.claude-3-5-sonnet-20241022-v2:0').
         agent_id: Logical agent identifier registered in the G8R console.
+        session_id: Optional per-instance default governance session id. When
+            set, calls from this instance are grouped under it unless an
+            enclosing ``run()`` scope or a propagated nested context supplies
+            one (those take precedence). ``None`` (the default) means a session
+            is established only when a ``run()`` scope or a top-level ``wrap()``
+            mints one — a lone ``check()`` then sends no session, exactly as
+            before. Governance lineage is ADVISORY / self-asserted (see the
+            module-level note); it is sent, never used to decide.
         timeout: HTTP request timeout in seconds (default: 10.0).
         block_on_escalated: When True, ``wrap()`` raises ``ShieldBlockedError`` on
             escalated decisions instead of proceeding with a warning. Default
@@ -236,6 +349,7 @@ class AgentShield:
         "_employee_name",
         "_ai_model",
         "_agent_id",
+        "_session_id",
         "_timeout",
         "_block_on_escalated",
     )
@@ -251,6 +365,7 @@ class AgentShield:
         employee_name: str | None = None,
         ai_model: str = "unknown",
         agent_id: str = "sdk-client",
+        session_id: str | None = None,
         timeout: float = 10.0,
         block_on_escalated: bool = False,
         credential_provider: Callable[[], str] | None = None,
@@ -301,6 +416,7 @@ class AgentShield:
         self._employee_name = employee_name
         self._ai_model = ai_model
         self._agent_id = agent_id
+        self._session_id = session_id
         self._timeout = timeout
         self._block_on_escalated = block_on_escalated
 
@@ -327,6 +443,12 @@ class AgentShield:
 
         Returns a :class:`PolicyDecision`. Does NOT raise on blocked/escalated —
         use the returned decision to decide what to do next.
+
+        Governance lineage (``sessionId`` + ``parentAgents``) is read from the
+        ambient context and SENT on both ``/check`` and ``/log`` when a run or
+        nesting is in effect. Unlike ``wrap()``, ``check()`` is a POINT
+        evaluation — it does not open a nested scope of its own. A lone
+        ``check()`` outside any run sends neither field (backward-compatible).
 
         Args:
             prompt: The raw prompt or action string to evaluate.
@@ -373,6 +495,17 @@ class AgentShield:
                 requests proceed (with a warning) by default, mirroring the
                 TypeScript SDK contract. Set ``block_on_escalated=True`` at
                 construction time to raise on escalated instead.
+
+        Sub-agent lineage: ``wrap()`` reads the ambient governance context and
+        governs this call under it — sending ``sessionId`` and the ancestor
+        ``parentAgents`` chain — then, if the decision ALLOWS (or escalates and
+        proceeds), runs ``factory()`` inside a scope that extends the chain with
+        this instance's ``agent_id``. Any g8r_shield call nested inside
+        ``factory()`` therefore inherits the SAME session and this agent as its
+        immediate parent — with no manual instrumentation. A top-level
+        ``wrap()`` (no enclosing run) mints a fresh session and sends an empty
+        parent chain. Lineage is sent, never used to decide, and is advisory /
+        self-asserted (see the module-level note).
         """
         # Generate a single request_id for this wrap() invocation and thread
         # it through both the policy check and the audit log so the two
@@ -381,63 +514,184 @@ class AgentShield:
         # and the policy→action linkage is lost.
         request_id = str(uuid.uuid4())
 
-        # Reuse the PUBLIC check() path with logging suppressed. Suppressing the
-        # log here (rather than letting check() log) avoids a duplicate audit
-        # entry — wrap() writes exactly one /log line, explicitly, below. This
-        # keeps a single call graph (check → log) for both check() and wrap().
-        decision = self.check(prompt, request_id=request_id, log=False)
+        # ── Resolve governance lineage for this invocation ──────────────────
+        # Inherit the session from the ambient context if a run is already in
+        # flight, else this instance's default, else mint one — a top-level
+        # wrap() always establishes a run. ``parent_agents`` is the chain of
+        # everyone ABOVE this agent (empty at the top level); this agent is not
+        # in it yet — it is appended only around factory() below.
+        ambient = _AMBIENT_CONTEXT.get()
+        session = ambient.session_id or self._session_id or str(uuid.uuid4())
+        parent_agents = ambient.agent_chain
 
-        # Audit-log the attempt regardless of decision so it appears in the
-        # Console audit trail. Done before enforcement so blocked decisions
-        # are recorded even if downstream code never sees them.
-        self._log(prompt, decision, request_id=request_id)
+        # Pin the resolved session + parent chain as the ambient context for
+        # THIS agent's own /check and /log, so the suppressed-log check() call
+        # and the explicit _log() below both report the same session and
+        # ancestry (a freshly minted session would otherwise be invisible to
+        # them, since they read the ambient context). Restored unconditionally
+        # in the finally — allow, deny, escalate, or raise — via token reset,
+        # so lineage never leaks past the call that established it.
+        eval_token = _AMBIENT_CONTEXT.set(
+            _GovernanceContext(session_id=session, agent_chain=parent_agents)
+        )
+        try:
+            # Reuse the PUBLIC check() path with logging suppressed. Suppressing
+            # the log here (rather than letting check() log) avoids a duplicate
+            # audit entry — wrap() writes exactly one /log line, explicitly,
+            # below. This keeps a single call graph (check → log) for both
+            # check() and wrap().
+            decision = self.check(prompt, request_id=request_id, log=False)
 
-        if decision.decision == "allowed":
-            return factory()
+            # Audit-log the attempt regardless of decision so it appears in the
+            # Console audit trail. Done before enforcement so blocked decisions
+            # are recorded even if downstream code never sees them.
+            self._log(prompt, decision, request_id=request_id)
 
-        if decision.decision == "blocked":
-            if decision.session_revoked:
+            if decision.decision == "allowed":
+                return self._invoke_in_scope(
+                    factory, session_id=session, parent_agents=parent_agents
+                )
+
+            if decision.decision == "blocked":
+                if decision.session_revoked:
+                    _LOGGER.warning(
+                        "session_revoked",
+                        tenant_id=self._tenant_id,
+                        agent_id=self._agent_id,
+                        reason=decision.reason,
+                    )
+                raise ShieldBlockedError(decision)
+
+            if decision.decision == "escalated":
+                if self._block_on_escalated:
+                    # Strict mode — treat escalated like blocked. Caller opted
+                    # in at construction time.
+                    raise ShieldBlockedError(decision)
                 _LOGGER.warning(
-                    "session_revoked",
+                    "action_escalated",
                     tenant_id=self._tenant_id,
                     agent_id=self._agent_id,
                     reason=decision.reason,
                 )
-            raise ShieldBlockedError(decision)
+                return self._invoke_in_scope(
+                    factory, session_id=session, parent_agents=parent_agents
+                )
 
-        if decision.decision == "escalated":
-            if self._block_on_escalated:
-                # Strict mode — treat escalated like blocked. Caller opted in
-                # at construction time.
-                raise ShieldBlockedError(decision)
-            _LOGGER.warning(
-                "action_escalated",
-                tenant_id=self._tenant_id,
-                agent_id=self._agent_id,
-                reason=decision.reason,
+            # Exhaustive switch: any decision value we don't recognise fails
+            # CLOSED rather than silently proceeding to factory(). Mirrors the
+            # TypeScript SDK's ts-pattern `.exhaustive()`. A future 4th decision
+            # value surfaces here loudly instead of being treated as "allowed"
+            # by omission.
+            raise ShieldBlockedError(
+                PolicyDecision(
+                    decision=decision.decision,
+                    reason=(
+                        f"[G8R Shield] Unrecognised policy decision "
+                        f"{decision.decision!r}; failing closed."
+                    ),
+                    violated_rule=decision.violated_rule,
+                    requires_approval=decision.requires_approval,
+                    session_revoked=decision.session_revoked,
+                    compliance_mappings=decision.compliance_mappings,
+                    redacted_tokens=decision.redacted_tokens,
+                )
             )
-            return factory()
+        finally:
+            # Restore the caller's ambient context. Even when factory() ran in
+            # its own extended scope (already restored by _invoke_in_scope),
+            # this unwinds the eval-time pin so nothing leaks to sibling calls.
+            _AMBIENT_CONTEXT.reset(eval_token)
 
-        # Exhaustive switch: any decision value we don't recognise fails CLOSED
-        # rather than silently proceeding to factory(). Mirrors the TypeScript
-        # SDK's ts-pattern `.exhaustive()`. A future 4th decision value surfaces
-        # here loudly instead of being treated as "allowed" by omission.
-        raise ShieldBlockedError(
-            PolicyDecision(
-                decision=decision.decision,
-                reason=(
-                    f"[G8R Shield] Unrecognised policy decision "
-                    f"{decision.decision!r}; failing closed."
-                ),
-                violated_rule=decision.violated_rule,
-                requires_approval=decision.requires_approval,
-                session_revoked=decision.session_revoked,
-                compliance_mappings=decision.compliance_mappings,
-                redacted_tokens=decision.redacted_tokens,
-            )
+    def run(self, session_id: str | None = None) -> _RunScope:
+        """Group a block of calls under one governance session, without ``wrap()``.
+
+        Use as a context manager to establish (or adopt) an ambient session
+        that every ``check()`` / ``wrap()`` inside the block reports under::
+
+            with shield.run() as session_id:
+                shield.check("step one")
+                shield.wrap(lambda: call_llm(prompt), prompt)  # same session
+
+        Resolution: an explicit ``session_id`` argument wins; otherwise an
+        already-active ambient session is adopted (so nesting ``run()`` does not
+        split a run), then this instance's default, then a freshly minted
+        uuid4. The active session id is yielded for convenience. The agent
+        chain is left untouched — ``run()`` establishes a session, not a
+        parent hop. The previous ambient context is restored on exit, even on
+        exception (contextvars token reset).
+        """
+        return _RunScope(explicit_session=session_id, instance_session=self._session_id)
+
+    def child(self, agent_id: str) -> _RunScope:
+        """Manually declare a nested agent hop, for nesting outside ``wrap()``.
+
+        ``wrap()`` propagates lineage automatically; reach for ``child()`` only
+        when a nested agent runs OUTSIDE a wrapped factory but should still be
+        governed as a descendant::
+
+            with shield.child(agent_id="planner"):
+                shield.wrap(lambda: call_llm(prompt), prompt)  # parentAgents=[..., "planner"]
+
+        Appends ``agent_id`` to the ambient chain (root-first, immediate-parent
+        last) for the block, carrying the current session (minting one if none
+        is active). The previous context is restored on exit, even on exception.
+        """
+        return _RunScope(
+            explicit_session=None, instance_session=self._session_id, push_agent=agent_id
         )
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _invoke_in_scope(
+        self,
+        factory: Callable[[], T],
+        *,
+        session_id: str,
+        parent_agents: tuple[str, ...],
+    ) -> T:
+        """Run ``factory()`` with the ambient context extended by this agent.
+
+        Sets the ambient governance context to the resolved session plus the
+        parent chain with this instance's ``agent_id`` APPENDED (root-first,
+        immediate-parent last), so any g8r_shield call nested inside
+        ``factory()`` inherits the same session and this agent as its immediate
+        parent. The previous context is restored on exit — even if
+        ``factory()`` raises — via `contextvars` token reset.
+        """
+        nested_token = _AMBIENT_CONTEXT.set(
+            _GovernanceContext(
+                session_id=session_id,
+                agent_chain=parent_agents + (self._agent_id,),
+            )
+        )
+        try:
+            return factory()
+        finally:
+            _AMBIENT_CONTEXT.reset(nested_token)
+
+    def _lineage_fields(self) -> dict[str, Any]:
+        """Build the additive lineage fragment for an outbound request body.
+
+        Reads the ambient governance context and folds in this instance's
+        ``session_id`` default. Both fields are OPTIONAL on the wire and are
+        OMITTED when empty, so a call with no run and no nesting sends exactly
+        the body it sent before this feature existed (backward-compatible):
+
+        * ``sessionId`` — the ambient session, else the instance default;
+          absent when neither is set.
+        * ``parentAgents`` — the ancestor chain (root-first, immediate-parent
+          last); absent at the top level.
+
+        Sent only; lineage never influences the policy decision.
+        """
+        ctx = _AMBIENT_CONTEXT.get()
+        fields: dict[str, Any] = {}
+        session_id = ctx.session_id or self._session_id
+        if session_id:
+            fields["sessionId"] = session_id
+        if ctx.agent_chain:
+            fields["parentAgents"] = list(ctx.agent_chain)
+        return fields
 
     def _bearer_credential(self) -> str:
         """Resolve the Bearer value for ONE outbound request.
@@ -508,6 +762,9 @@ class AgentShield:
             "userId": self._user_id,
             "aiModel": self._ai_model,
             "agentId": self._agent_id,
+            # Additive sub-agent lineage — sessionId + parentAgents when a run
+            # or nesting is in effect; absent otherwise (see `_lineage_fields`).
+            **self._lineage_fields(),
         }
 
         # Single retry on transient network failures. Hard failures (4xx HTTP
@@ -613,6 +870,9 @@ class AgentShield:
                 }
                 for m in decision.compliance_mappings
             ],
+            # Additive sub-agent lineage — same session + parent chain the
+            # matching /check reported; absent when no run/nesting is active.
+            **self._lineage_fields(),
         }
 
         try:

@@ -34,14 +34,16 @@
  */
 
 import { match } from 'ts-pattern';
-import { newRequestId, type RequestId, type TenantId } from './ids';
+import { newRequestId, newSessionId, type RequestId, type TenantId } from './ids';
+import { getGovernanceContext, runWithGovernanceContext } from './context';
 import { log } from './logger';
 import { redactSensitiveData } from './redaction';
 
 // ── Public API re-exports ────────────────────────────────────────────────────
 // Consumers need `tenantId()` to construct the branded TenantId required by
 // ShieldConfig, and `redactSensitiveData` is documented as a public helper.
-export { tenantId, newRequestId } from './ids';
+// `newSessionId()` mints the ambient-session id used for sub-agent lineage.
+export { tenantId, newRequestId, newSessionId } from './ids';
 export type { TenantId, RequestId } from './ids';
 export { redactSensitiveData } from './redaction';
 export type { RedactionResult } from './redaction';
@@ -51,7 +53,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -129,6 +131,17 @@ export interface ShieldConfig {
   aiModel?: string;
   /** Optional: agent identifier (defaults to "sdk-client"). */
   agentId?: string;
+  /**
+   * Optional: per-instance default session id — the stable id for one logical
+   * agent run, propagated across nested and multi-turn calls (see sub-agent
+   * lineage). When set, every wrap()/check() from this instance reports this
+   * session UNLESS an ambient session (from a surrounding {@link
+   * AgentShield.run} or a parent wrap()) overrides it. When unset, wrap() mints
+   * a fresh session per top-level call and a standalone check() with no ambient
+   * session sends none — so existing, non-nested usage is unchanged. Sent as
+   * the additive wire field `sessionId`; advisory / self-asserted trust.
+   */
+  sessionId?: string;
   /** Optional: employee display name for the audit trail (falls back to userId at /log time). */
   employeeName?: string;
   /** Optional: HTTP request timeout in seconds applied to both /check and /log (defaults to 10). */
@@ -211,6 +224,18 @@ export interface CheckOptions {
   log?: boolean;
 }
 
+/**
+ * Ambient governance lineage resolved for a single outbound request: the
+ * session this call belongs to and the ancestor agent chain that led here
+ * (root-first). Both are advisory, self-asserted metadata for the governance
+ * plane — they are SENT on /check and /log but never influence the local
+ * decision path.
+ */
+interface RequestLineage {
+  sessionId?: string;
+  parentAgents: string[];
+}
+
 export class AgentShield {
   private readonly consoleUrl: string;
   private readonly credential: () => string | Promise<string>;
@@ -219,6 +244,8 @@ export class AgentShield {
   private readonly userId: string;
   private readonly aiModel: string;
   private readonly agentId: string;
+  /** Per-instance default session id (see ShieldConfig.sessionId). Undefined = none configured. */
+  private readonly sessionId?: string;
   private readonly employeeName?: string;
   private readonly timeoutMs: number;
   private readonly blockOnEscalated: boolean;
@@ -279,6 +306,9 @@ export class AgentShield {
     // Normalize agentId to a construction-time value so BOTH /check and /log
     // always send the same agentId (no inline '?? sdk-client' per call site).
     this.agentId = config.agentId ?? DEFAULT_AGENT_ID;
+    // Optional per-instance default session. Left undefined when not configured
+    // so a lone check() stays on the pre-lineage wire (no sessionId field).
+    this.sessionId = config.sessionId;
     this.employeeName = config.employeeName;
     this.timeoutMs = (config.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000;
     this.blockOnEscalated = config.blockOnEscalated ?? false;
@@ -318,10 +348,16 @@ export class AgentShield {
     const requestId = opts.requestId ?? newRequestId();
     const shouldLog = opts.log ?? true;
 
-    const result = await this.evaluate(prompt, requestId);
+    // Read the ambient governance lineage (session + ancestor chain) and report
+    // it on /check — and, when self-auditing, on /log with the same requestId. A
+    // standalone check() only REPORTS the lineage it already runs under; it
+    // never opens a nested scope and never mints a session (see ambientLineage).
+    const lineage = this.ambientLineage();
+
+    const result = await this.evaluate(prompt, requestId, lineage);
 
     if (shouldLog) {
-      await this.log(prompt, result, requestId);
+      await this.log(prompt, result, requestId, lineage);
     }
 
     return result;
@@ -333,6 +369,14 @@ export class AgentShield {
    * The `llmCallFactory` is a function that creates the LLM promise. It is only
    * invoked if the policy engine allows the action, preventing the LLM call from
    * executing before the policy check completes.
+   *
+   * Governance lineage (session + parent-agent chain) is propagated
+   * automatically: a top-level wrap() mints a fresh session and an empty
+   * ancestor chain; the factory then runs inside an ambient scope, so any
+   * wrapped call it makes inherits the same session and an ancestor chain that
+   * now ends with this agent (root-first). Nested hops therefore self-assemble
+   * their lineage with no manual instrumentation. Lineage is advisory metadata
+   * for the governance plane and NEVER changes the local decision.
    *
    * @param llmCallFactory - A function that returns the LLM call promise
    * @param prompt - The prompt text to evaluate against the policy engine
@@ -354,14 +398,27 @@ export class AgentShield {
     // /check and /log so the two server-side log lines can be joined end-to-end.
     const requestId = newRequestId();
 
-    // Step 1: Check the prompt against the policy engine (includes redaction).
-    // Suppress check()'s own logging — we log once explicitly below with the same
-    // requestId so blocked attempts are still recorded without a duplicate entry.
-    const policyResult = await this.check(prompt, { requestId, log: false });
+    // Resolve THIS hop's governance lineage from the ambient context. A
+    // top-level call has no ambient context, so it MINTS a fresh session (or
+    // adopts the per-instance configured session) and starts with an empty
+    // ancestor chain; a nested call inherits its parent's session and ancestor
+    // chain verbatim. These values are what we SEND — the ancestor chain does
+    // not yet include this agent (that extension is applied around the factory
+    // in Step 4). Lineage never changes the decision.
+    const ctx = getGovernanceContext();
+    const sessionId = ctx?.sessionId ?? this.sessionId ?? newSessionId();
+    const parentAgents = ctx?.agentChain ?? [];
+    const lineage: RequestLineage = { sessionId, parentAgents };
+
+    // Step 1: Check the prompt against the policy engine (includes redaction),
+    // reporting the resolved lineage. We evaluate directly (rather than via the
+    // public check()) so /check and /log share this exact lineage — including a
+    // freshly minted session that is not yet in the ambient store.
+    const policyResult = await this.evaluate(prompt, requestId, lineage);
 
     // Step 2: Log the attempt regardless of decision, BEFORE enforcement, so even
     // blocked attempts land in the audit trail. log() redacts before transmitting.
-    await this.log(prompt, policyResult, requestId);
+    await this.log(prompt, policyResult, requestId, lineage);
 
     // Step 3: Enforce the decision. Exhaustive match — adding a fourth decision
     // value will fail TypeScript compilation here until handled (fail-closed).
@@ -407,11 +464,80 @@ export class AgentShield {
       })
       .exhaustive();
 
-    // Step 4: Only now invoke the LLM call — after the policy check passed.
-    return llmCallFactory();
+    // Step 4: Only now invoke the LLM call — after the policy check passed —
+    // and do it INSIDE the extended ambient scope so any wrapped call the
+    // factory makes (directly, or via an awaited continuation) inherits this
+    // session and an ancestor chain that now ends with this agent (root-first).
+    // AsyncLocalStorage auto-restores the prior context when run() returns,
+    // including if the factory throws. Escalated-but-proceeding calls fall
+    // through here too, so their nested calls are governed with chain awareness
+    // just like allowed ones.
+    return runWithGovernanceContext(
+      { sessionId, agentChain: [...parentAgents, this.agentId] },
+      () => llmCallFactory()
+    );
+  }
+
+  /**
+   * Establish an ambient governance session for the duration of `fn`, so every
+   * wrap()/check() call made inside it — across awaits and nested agents —
+   * shares one sessionId with no manual threading. Multi-turn conversations and
+   * fan-out tool calls that belong to ONE logical run should live inside a
+   * single run() so the governance plane can stitch them together.
+   *
+   * The session is resolved as: an explicit `opts.sessionId` → the ambient
+   * session already in scope → this instance's configured sessionId → a freshly
+   * minted one. Any ancestor agent chain already in scope is PRESERVED: run()
+   * groups calls under a session, it does not itself add an agent hop — wrap()
+   * is what extends the chain. The prior context is restored when `fn` returns
+   * or throws.
+   *
+   * Returns whatever `fn` returns (await it if `fn` is async). Lineage is
+   * advisory / self-asserted and never alters a decision.
+   *
+   * @example
+   *   await shield.run(async () => {
+   *     await shield.wrap(() => turn1(), prompt1);
+   *     await shield.wrap(() => turn2(), prompt2); // same sessionId as turn1
+   *   });
+   */
+  run<T>(fn: () => T, opts: { sessionId?: string } = {}): T {
+    const ctx = getGovernanceContext();
+    const sessionId = opts.sessionId ?? ctx?.sessionId ?? this.sessionId ?? newSessionId();
+    const agentChain = ctx?.agentChain ?? [];
+    return runWithGovernanceContext({ sessionId, agentChain }, fn);
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
+
+  /**
+   * Resolve the lineage for a standalone check()/log(): the AMBIENT session +
+   * ancestor chain, falling back to this instance's configured sessionId. Unlike
+   * wrap(), a standalone check NEVER mints a session — a lone call with no
+   * ambient context and no configured session carries neither field, so the wire
+   * stays byte-for-byte the pre-lineage contract (full backward compatibility).
+   */
+  private ambientLineage(): RequestLineage {
+    const ctx = getGovernanceContext();
+    return {
+      sessionId: ctx?.sessionId ?? this.sessionId,
+      parentAgents: ctx?.agentChain ?? [],
+    };
+  }
+
+  /**
+   * The two additive lineage wire fields, included ONLY when meaningful —
+   * matching the present-only-when-meaningful style of sessionRevoked /
+   * redactedTokens / isPendingRegistration. A top-level call with an empty chain
+   * omits `parentAgents`; a call with no session omits `sessionId`. Absent
+   * fields keep pre-lineage consumers on the exact old wire contract.
+   */
+  private lineageWireFields(lineage: RequestLineage): Record<string, unknown> {
+    return {
+      ...(lineage.sessionId ? { sessionId: lineage.sessionId } : {}),
+      ...(lineage.parentAgents.length > 0 ? { parentAgents: lineage.parentAgents } : {}),
+    };
+  }
 
   /**
    * POST the redacted prompt + governance fields to /api/sdk/v1/check and parse
@@ -419,7 +545,11 @@ export class AgentShield {
    * after a short backoff, then raises ShieldConnectionError. Non-2xx responses
    * raise ShieldConsoleError, whose message never carries the raw body.
    */
-  private async evaluate(prompt: string, requestId: RequestId): Promise<PolicyCheckResult> {
+  private async evaluate(
+    prompt: string,
+    requestId: RequestId,
+    lineage: RequestLineage
+  ): Promise<PolicyCheckResult> {
     // Step 1: Local-first redaction — strip recognized secrets and PII before
     // the prompt reaches the remote gateway.
     const { redacted, tokensReplaced } = redactSensitiveData(prompt);
@@ -443,6 +573,9 @@ export class AgentShield {
       userId: this.userId,
       aiModel: this.aiModel,
       agentId: this.agentId, // construction-time value — same on /check and /log
+      // Additive lineage fields (sessionId / parentAgents), present only when
+      // meaningful — omitted entirely for a plain top-level, un-nested call.
+      ...this.lineageWireFields(lineage),
     });
 
     // Single retry on transient network failures (connection refused / timeout).
@@ -524,7 +657,8 @@ export class AgentShield {
   private async log(
     input: string,
     result: PolicyCheckResult,
-    requestId?: RequestId
+    requestId?: RequestId,
+    lineage: RequestLineage = { parentAgents: [] }
   ): Promise<ShieldLogEntry | null> {
     const id = requestId ?? newRequestId();
     const scopedLog = log.child({
@@ -566,6 +700,10 @@ export class AgentShield {
           violatedRule: result.violatedRule,
           requiresApproval: result.requiresApproval,
           complianceMappings: result.complianceMappings,
+          // Same additive lineage fields as /check, so the audit trail records
+          // the session + parent-agent chain this call ran under (present only
+          // when meaningful — a plain top-level call carries neither).
+          ...this.lineageWireFields(lineage),
         }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
