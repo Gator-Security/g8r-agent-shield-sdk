@@ -50,7 +50,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -e ".[dev]"
+      # [dev,adk], not [dev]: tests/test_adk_plugin.py opens with
+      # pytest.importorskip("google.adk"), so without the adk extra every ADK test SKIPS and the
+      # plugin ships with no CI coverage at all — a green check that proves nothing about it.
+      - run: pip install -e ".[dev,adk]"
       - run: ruff check .
       - run: mypy --strict g8r_shield
+      # tests/test_adk_extra_installed.py fails (not skips) under CI=true if the adk extra is
+      # missing, so this can never quietly regress to a green check over skipped tests.
       - run: pytest

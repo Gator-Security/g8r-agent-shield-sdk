@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from .redaction import redact_sensitive_data
 from .shield import (
@@ -47,7 +47,6 @@ from .shield import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from google.adk.agents.callback_context import CallbackContext
-    from google.adk.agents.invocation_context import InvocationContext
     from google.adk.models.llm_request import LlmRequest
     from google.adk.models.llm_response import LlmResponse
     from google.adk.tools.base_tool import BaseTool
@@ -91,7 +90,7 @@ class ShieldPlugin(BasePlugin):
 
     # -- helpers ---------------------------------------------------------------------------
 
-    def _describe_tool(self, tool: "BaseTool", tool_args: dict[str, Any]) -> str:
+    def _describe_tool(self, tool: BaseTool, tool_args: dict[str, Any]) -> str:
         """Render the action for policy evaluation.
 
         The PDP scans this string (it lands in ``action.intent`` -> ``GovernedEvent``), so it
@@ -106,7 +105,7 @@ class ShieldPlugin(BasePlugin):
         return rendered
 
     @staticmethod
-    def _lineage(tool_context: "ToolContext") -> tuple[str | None, list[str]]:
+    def _lineage(tool_context: ToolContext) -> tuple[str | None, list[str]]:
         """Map ADK's invocation identity onto the SDK's governance lineage.
 
         ``invocation_id`` is stable for one logical agent run, which is exactly the SDK's
@@ -166,7 +165,7 @@ class ShieldPlugin(BasePlugin):
             "violated_rule": rule,
         }
 
-    def _on_error(self, exc: Exception) -> Optional[dict[str, Any]]:
+    def _on_error(self, exc: Exception) -> dict[str, Any] | None:
         if self._fail_open:
             return None  # explicit operator choice; the call proceeds ungoverned
         return self._denial(
@@ -179,10 +178,10 @@ class ShieldPlugin(BasePlugin):
     async def before_tool_callback(
         self,
         *,
-        tool: "BaseTool",
+        tool: BaseTool,
         tool_args: dict[str, Any],
-        tool_context: "ToolContext",
-    ) -> Optional[dict[str, Any]]:
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
         """Returning non-None short-circuits the tool: the side effect never happens."""
         if not self._gate_tools:
             return None
@@ -208,9 +207,9 @@ class ShieldPlugin(BasePlugin):
     async def before_model_callback(
         self,
         *,
-        callback_context: "CallbackContext",
-        llm_request: "LlmRequest",
-    ) -> Optional["LlmResponse"]:
+        callback_context: CallbackContext,
+        llm_request: LlmRequest,
+    ) -> LlmResponse | None:
         """Optional prompt gate. OFF by default — see the module docstring."""
         if not self._gate_prompts:
             return None
@@ -238,7 +237,7 @@ class ShieldPlugin(BasePlugin):
         )
 
 
-def _last_user_text(llm_request: "LlmRequest") -> str:
+def _last_user_text(llm_request: LlmRequest) -> str:
     """Best-effort extraction of the newest user turn, tolerant of ADK shape changes."""
     contents = getattr(llm_request, "contents", None) or []
     for content in reversed(list(contents)):
@@ -251,7 +250,7 @@ def _last_user_text(llm_request: "LlmRequest") -> str:
     return ""
 
 
-def _refusal_response(message: str) -> "LlmResponse":
+def _refusal_response(message: str) -> LlmResponse:
     from google.adk.models.llm_response import LlmResponse
     from google.genai import types
 
