@@ -7,16 +7,16 @@
  * point of a canonical surface.
  *
  * This test pins the TypeScript side of the contract:
- *   1. The exported VERSION matches package.json AND the canonical 0.4.0.
+ *   1. The exported VERSION matches package.json AND the canonical 0.5.0.
  *   2. The User-Agent identifies the TS SDK + version (mirror of
  *      Python's `g8r-shield-python/{version}`).
- *   3. The /check and /log wire payloads carry EXACTLY the canonical field set
+ *   3. The PEP /proxy and /log wire payloads carry EXACTLY the canonical field set
  *      when NO lineage is active (proving the additive sub-agent-lineage fields
  *      are backward-compatible — absent on a plain, un-nested call).
  *   4. The defaulted-not-required fields resolve to the canonical defaults.
- *   5. employeeName is on /log only, never on /check.
+ *   5. employeeName is on /log only, never on /proxy.
  *   6. Under active lineage, the ONLY new fields are `sessionId` +
- *      `parentAgents` — the two additive fields the 0.4.0 wire contract gained.
+ *      `parentAgents` — the two additive fields the 0.5.0 wire contract gained.
  *
  * The Python contract test asserts the same field sets against the same
  * canonical version, so a drift on either side breaks CI.
@@ -27,7 +27,7 @@ import { join } from 'node:path';
 import { AgentShield, VERSION } from '../src/index';
 import { tenantId } from '../src/ids';
 
-const CANONICAL_VERSION = '0.4.0';
+const CANONICAL_VERSION = '0.5.0';
 
 // The exact governance field set the /check payload must carry (order-independent).
 const CANONICAL_CHECK_FIELDS = [
@@ -84,7 +84,7 @@ describe('canonical parity', () => {
     jest.restoreAllMocks();
   });
 
-  it('exports VERSION equal to the canonical 0.4.0', () => {
+  it('exports VERSION equal to the canonical 0.5.0', () => {
     expect(VERSION).toBe(CANONICAL_VERSION);
   });
 
@@ -99,6 +99,7 @@ describe('canonical parity', () => {
   it('sends a versioned, language-tagged User-Agent (mirror of python-vs-ts)', async () => {
     mockFetch([allowedResponse]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'),
@@ -108,9 +109,10 @@ describe('canonical parity', () => {
     expect(ua).toBe(`g8r-shield-typescript/${CANONICAL_VERSION}`);
   });
 
-  it('/check payload carries EXACTLY the canonical field set', async () => {
+  it('/proxy payload carries EXACTLY the canonical field set', async () => {
     mockFetch([allowedResponse]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'),
@@ -119,13 +121,14 @@ describe('canonical parity', () => {
     await shield.check('hi', { log: false });
     const body = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
     expect(Object.keys(body).sort()).toEqual(CANONICAL_CHECK_FIELDS);
-    // employeeName is NEVER on /check.
+    // employeeName is NEVER on PEP /proxy.
     expect(body).not.toHaveProperty('employeeName');
   });
 
   it('/log payload carries EXACTLY the canonical field set (no lineage → back-compat)', async () => {
     mockFetch([allowedResponse, { id: 'log' }]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'),
@@ -141,10 +144,11 @@ describe('canonical parity', () => {
 
   it('adds ONLY sessionId + parentAgents to the wire under active lineage', async () => {
     // Nested wrap() so lineage is fully populated: an inner call inherits the
-    // session and carries a non-empty ancestor chain. The 0.4.0 contract gained
-    // exactly these two additive fields on BOTH /check and /log — nothing else.
+    // session and carries a non-empty ancestor chain. The 0.5.0 contract gained
+    // exactly these two additive fields on BOTH PEP /proxy and /log — nothing else.
     mockFetch([allowedResponse, { id: 'log' }, allowedResponse, { id: 'log' }]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'),
@@ -155,7 +159,7 @@ describe('canonical parity', () => {
       return 'outer';
     }, 'outer');
 
-    // Fetch order: [0] outer /check, [1] outer /log, [2] inner /check, [3] inner /log.
+    // Fetch order: [0] outer /proxy, [1] outer /log, [2] inner /proxy, [3] inner /log.
     const innerCheck = JSON.parse((global.fetch as jest.Mock).mock.calls[2][1].body);
     const innerLog = JSON.parse((global.fetch as jest.Mock).mock.calls[3][1].body);
 
@@ -167,7 +171,7 @@ describe('canonical parity', () => {
     );
     expect(typeof innerCheck.sessionId).toBe('string');
     expect(innerCheck.parentAgents).toEqual(['root']); // root-first ancestor chain
-    // /check and /log agree on the lineage for the same hop.
+    // /proxy and /log agree on the lineage for the same hop.
     expect(innerLog.sessionId).toBe(innerCheck.sessionId);
     expect(innerLog.parentAgents).toEqual(innerCheck.parentAgents);
   });
@@ -175,6 +179,7 @@ describe('canonical parity', () => {
   it('resolves the canonical defaulted-not-required field values', async () => {
     mockFetch([allowedResponse]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'), // only hard-required field
@@ -200,9 +205,10 @@ describe('canonical parity', () => {
     ).toThrow(/tenantId is required/);
   });
 
-  it('uses the same agentId on /check and /log (construction-time normalization)', async () => {
+  it('uses the same agentId on PEP /proxy and /log (construction-time normalization)', async () => {
     mockFetch([allowedResponse, { id: 'log' }]);
     const shield = new AgentShield({
+      pepUrl: 'http://pep',
       consoleUrl: 'http://c',
       apiKey: 'k',
       tenantId: tenantId('acme'),

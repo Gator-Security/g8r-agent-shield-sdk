@@ -25,6 +25,7 @@ from g8r_shield import AgentShield, ShieldBlockedError
 
 shield = AgentShield(
     tenant_id="acme-corp",
+    pep_url="https://pep.yourcompany.com",
     console_url="https://shield.yourcompany.com",
     api_key="sk-shield-...",
     department="Finance",
@@ -48,7 +49,7 @@ except ShieldBlockedError as err:
         print(f"  {m.regulation} {m.control_id} — {m.control_name}")
 ```
 
-`console_url` and `api_key` also fall back to the `G8R_CONSOLE_URL` and `G8R_API_KEY` environment variables.
+`pep_url`, `console_url` and `api_key` also fall back to the `G8R_PEP_URL`, `G8R_CONSOLE_URL` and `G8R_API_KEY` environment variables.
 
 ## How It Works
 
@@ -56,7 +57,7 @@ except ShieldBlockedError as err:
 caller invokes shield.wrap(factory, prompt)
        |
        v
-shield.check(prompt) → POST /api/sdk/v1/check
+shield.check(prompt) → POST PEP /proxy (SINGLE DECISION POINT)
        |
        v
 Policy Engine evaluates against your configured policy set
@@ -66,11 +67,15 @@ Policy Engine evaluates against your configured policy set
        +--> ALLOWED   → Factory invoked, LLM executes
        |
        v
-shield._log() → POST /api/sdk/v1/log
+shield._log() → POST /api/sdk/v1/log (audit adjunct only, no decision)
        |
        v
 Interaction recorded in Agent Shield Console
 ```
+
+**Important: Single Decision Point Rule**
+
+The SDK enforces the **one-hop rule**: policy decisions come from **PEP `/proxy` only**. The factory function is invoked after the PEP decision allows it, but the factory itself should **not** make a second policy check. The management API `/log` endpoint is used for audit trail (adjunct function), never for blocking decisions.
 
 The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LLM call **never executes** when the policy blocks it.
 
@@ -81,6 +86,7 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 | Parameter            | Type            | Required | Default                                     | Description                              |
 | -------------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
 | `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty |
+| `pep_url`            | `str`           | Yes\*    | `G8R_PEP_URL` env, fallback to `console_url` | URL of the Policy Enforcement Point (PEP). Pass directly or set `G8R_PEP_URL`; if neither is present, falls back to `console_url` with a warning |
 | `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback) |
 | `api_key`            | `str`           | Yes\*    | `G8R_API_KEY` env                           | Static Bearer credential (your deployment's shared secret). Pass directly or set `G8R_API_KEY`; a missing value raises `ValueError`. Mutually exclusive with `credential_provider` |
 | `credential_provider` | `Callable[[], str]` | No  | `None`                                      | Zero-argument callable returning the Bearer credential, invoked fresh for every request — for short-lived tokens such as OIDC JWTs. Mutually exclusive with an explicit `api_key` (`ValueError` if both are passed); when set, `G8R_API_KEY` is ignored. See [Short-lived credentials](#short-lived-credentials-oidc--aws-workload-identity) |
@@ -93,7 +99,7 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 | `timeout`            | `float`         | No       | `10.0`                                      | HTTP request timeout in seconds          |
 | `block_on_escalated` | `bool`          | No       | `False`                                     | When `True`, `wrap()` raises `ShieldBlockedError` on escalated decisions instead of proceeding with a warning (fail-closed) |
 
-\* `console_url` and `api_key` may be supplied either as keyword arguments or via the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither source provides a value, the constructor raises `ValueError`.
+\* `pep_url`, `console_url` and `api_key` may be supplied either as keyword arguments or via the `G8R_PEP_URL`, `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither source provides a value for `console_url` or `api_key`, the constructor raises `ValueError`. If `pep_url` is missing, it falls back to `console_url` with a warning.
 
 ### `shield.check(prompt: str) -> PolicyDecision`
 

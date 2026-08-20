@@ -45,6 +45,7 @@ from .conftest import (
     CHECK_URL,
     CONSOLE_URL,
     LOG_URL,
+    PEP_URL,
     allowed_response,
     blocked_response,
     denied_registration_response,
@@ -292,6 +293,37 @@ class TestWrap:
         assert esc_logs[0]["agent_id"] == shield._agent_id
         assert esc_logs[0]["log_level"] == "warning"
         assert "Destructive operation" in esc_logs[0]["reason"]
+
+    @responses.activate
+    def test_no_double_decide_single_pep_decision_only(self, shield, mocker):
+        """Verify wrap() calls PEP /proxy (not management API /check) — single decision point."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        factory = mocker.Mock(return_value="result")
+        shield.wrap(factory, "test prompt")
+
+        # Verify we called PEP /proxy (CHECK_URL points to PEP /proxy now)
+        urls = [call.request.url for call in responses.calls]
+        assert CHECK_URL in urls
+        # Verify we did NOT call management API /check
+        assert f"{CONSOLE_URL}/api/sdk/v1/check" not in urls
+        # Audit log is still allowed (adjunct only, no decision)
+        assert LOG_URL in urls
+        # Should be exactly 2 calls: PEP /proxy + audit log
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_pep_headers_included(self, shield):
+        """Verify X-GF-Tenant-ID and X-GF-Agent-ID headers are sent to PEP."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.check("test", log=False)
+
+        pep_call = responses.calls[0]
+        assert pep_call.request.headers["X-GF-Tenant-ID"] == "tenant-test"
+        assert pep_call.request.headers["X-GF-Agent-ID"] == "test-agent"
 
     @responses.activate
     def test_escalated_with_block_on_escalated_raises(self, strict_shield, mocker):

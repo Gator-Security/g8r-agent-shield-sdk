@@ -18,7 +18,8 @@ import pytest
 from g8r_shield import AgentShield
 
 CONSOLE_URL = "https://test.example.com"
-CHECK_URL = f"{CONSOLE_URL}/api/sdk/v1/check"
+PEP_URL = "https://pep.example.com"
+CHECK_URL = f"{PEP_URL}/proxy"
 LOG_URL = f"{CONSOLE_URL}/api/sdk/v1/log"
 
 
@@ -27,6 +28,7 @@ def shield() -> AgentShield:
     """Default-configured AgentShield instance for tests."""
     return AgentShield(
         tenant_id="tenant-test",
+        pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         department="Engineering",
@@ -42,6 +44,7 @@ def strict_shield() -> AgentShield:
     """AgentShield with `block_on_escalated=True` for strict-mode tests."""
     return AgentShield(
         tenant_id="tenant-strict",
+        pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         department="Legal",
@@ -52,7 +55,7 @@ def strict_shield() -> AgentShield:
 
 
 # ── Response body factories ──────────────────────────────────────────────────
-# Helpers for building API response payloads in the shape /api/sdk/v1/check returns.
+# Helpers for building API response payloads in the shape PEP /proxy returns.
 
 
 def allowed_response() -> dict:
