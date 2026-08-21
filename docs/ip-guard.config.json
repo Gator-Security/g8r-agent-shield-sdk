@@ -4,7 +4,7 @@
     "README.md",
     "js/README.md",
     "python/README.md",
-    "docs/sdk-reference.md",
+    "docs/README.md",
     "docs/wrap-check-pep-one-hop.md",
     "js/src/**/*.ts",
     "python/g8r_shield/**/*.py",
