@@ -1,29 +1,10 @@
 # wrap / check / PEP one-hop
 
-`wrap()` and `check()` take one hop: `pepUrl` → `POST /proxy`. Configure
-`G8R_PEP_URL`, `G8R_CONSOLE_URL`, and `G8R_API_KEY`.
+`wrap()` takes one hop: `pepUrl` → PEP `POST /proxy`. Configure `G8R_PEP_URL`,
+`G8R_CONSOLE_URL`, and `G8R_API_KEY`.
 
-## Required property
-
-**One governed action = local redaction + one PEP `/proxy` hop, and exactly one
-PDP decision at that PEP.**
-
-`wrap()` does not add a second decide hop. The factory runs only after that
-decision allows it.
-
-```
-prompt
-  │
-  ├─ 1. redact locally
-  │
-  ├─ 2. ONE hop — pepUrl POST /proxy  →  exactly one PDP decision
-  │
-  └─ 3. invoke factory                →  only after allowed
-```
-
-`check()` is the same `/proxy` hop without a factory. Do not pair `check()` and
-`wrap()` on the same prompt if you need a single decision — each call is its
-own hop.
+The hop is inside `wrap()`. Do not call `wrap()` and then fetch `/proxy`
+yourself.
 
 ## wrap()
 
@@ -57,25 +38,10 @@ result = shield.wrap(lambda: model.complete(prompt), prompt)
 
 </CodeGroup>
 
-## check()
+`check()` is not a second hop you add after `wrap()`. Do not pair it with
+`wrap()` on the same prompt.
 
-Same `/proxy` hop. No factory.
-
-<CodeGroup>
-
-```typescript TypeScript
-const decision = await shield.check(prompt);
-// decision.decision → 'allowed' | 'blocked' | 'escalated'
-```
-
-```python Python
-decision = shield.check(prompt)
-# decision.decision → "allowed" | "blocked" | "escalated"
-```
-
-</CodeGroup>
-
-## After the hop
+## After `wrap()`
 
 | Decision    | `wrap()` |
 | ----------- | -------- |
