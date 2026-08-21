@@ -317,3 +317,57 @@ Both require an `Authorization: Bearer <credential>` header, where the credentia
 
 - Python 3.10+
 - `requests` 2.31+
+
+## Google ADK (Gemini Enterprise / Agent Engine)
+
+```bash
+pip install "g8r-shield[adk]"
+```
+
+```python
+from google.adk.runners import Runner
+from g8r_shield import AgentShield
+from g8r_shield.adk import ShieldPlugin
+
+shield = AgentShield(
+    tenant_id="...", console_url="https://console.example", api_key="...",
+    agent_id="support-bot", department="Support",
+)
+
+runner = Runner(
+    agent=root_agent,
+    app_name="support",
+    session_service=session_service,
+    plugins=[ShieldPlugin(shield)],     # governs the WHOLE agent tree
+)
+```
+
+One registration on the `Runner` covers every agent, sub-agent and tool — including agents added
+later. Per-agent callbacks have to be repeated on each agent, and anything a developer forgets to
+wire is silently ungoverned; a plugin cannot be forgotten.
+
+### What it does
+
+| Hook | Behaviour |
+|---|---|
+| `before_tool_callback` | **The gate.** Evaluates the tool + arguments; a block returns a denial dict so the side effect never happens and the model is told why. |
+| `before_model_callback` | Optional prompt gate — **off by default** (it evaluates every model turn, roughly doubling policy traffic). Enable with `gate_prompts=True`. |
+
+Sub-agent lineage is automatic: ADK's `invocation_id` becomes the governance `session_id`, and
+its `branch` (the agent hierarchy path) becomes the root-first parent chain, so the Console can
+stitch a multi-agent run back together.
+
+### Options
+
+| Option | Default | Notes |
+|---|---|---|
+| `gate_tools` | `True` | Evaluate tool calls. |
+| `gate_prompts` | `False` | Also evaluate each model turn. |
+| `fail_open` | `False` | **Fail-closed by default.** If the control plane is unreachable the tool is blocked — an outage must not silently become allow-all. Flipping this is an auditable choice. |
+| `redact` | `True` | Strip high-entropy secrets from tool arguments before they leave the process. PII is deliberately preserved so the server-side detectors can still enforce PII policy; the control plane keeps content out of the audit body. |
+
+### Async note
+
+ADK hooks are async; the Shield client is synchronous. The plugin runs every policy call on a
+worker thread (`asyncio.to_thread`), so a policy round trip never blocks the event loop — calling
+the client directly from a hook would stall every other agent in the process.

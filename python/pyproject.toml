@@ -55,6 +55,12 @@ dependencies = [
 bedrock = [
     "boto3>=1.34",
 ]
+adk = [
+    # Google Agent Development Kit. The plugin API (BasePlugin with keyword-only
+    # before_tool_callback) is 2.x; pinned to >=2.6 because that is what g8r_shield.adk is
+    # tested against. Imported lazily, so the base install never pulls it in.
+    "google-adk>=2.6",
+]
 dev = [
     "pytest>=8",
     "pytest-mock>=3.12",
