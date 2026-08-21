@@ -18,6 +18,9 @@ pip install "g8r-shield[bedrock]"
 
 Requires Python 3.10+. Pairs with a G8R Agent Shield console. See [RELEASING.md](https://github.com/Gator-Security/g8r-agent-shield-sdk/blob/main/RELEASING.md) for release and packaging details.
 
+SDK page (`wrap` / `check` / PEP one-hop):
+[`docs/wrap-check-pep-one-hop.md`](../docs/wrap-check-pep-one-hop.md).
+
 ## Quick Start
 
 ```python

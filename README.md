@@ -53,6 +53,7 @@ const result = await shield.wrap(
 ```
 
 Full TypeScript API: [`js/README.md`](./js/README.md).
+SDK page (`wrap` / `check` / PEP one-hop): [`docs/wrap-check-pep-one-hop.md`](./docs/wrap-check-pep-one-hop.md).
 
 ### Python
 
@@ -69,6 +70,7 @@ result = shield.wrap(lambda: call_your_llm(prompt), prompt)
 ```
 
 Full Python API: [`python/README.md`](./python/README.md).
+SDK page (`wrap` / `check` / PEP one-hop): [`docs/wrap-check-pep-one-hop.md`](./docs/wrap-check-pep-one-hop.md).
 
 ## Connecting to a self-hosted v2 Console
 

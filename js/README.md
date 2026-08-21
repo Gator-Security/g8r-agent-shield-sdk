@@ -2,7 +2,9 @@
 
 TypeScript client SDK for integrating AI agents with G8R policy enforcement. Includes a **local VPC redaction layer** that strips sensitive data before it ever leaves your network.
 
-Part of the [G8R Agent Shield monorepo](../../README.md).
+Part of the [G8R Agent Shield monorepo](../../README.md). SDK page
+(`wrap` / `check` / PEP one-hop):
+[`docs/wrap-check-pep-one-hop.md`](../docs/wrap-check-pep-one-hop.md).
 
 ## Overview
 
