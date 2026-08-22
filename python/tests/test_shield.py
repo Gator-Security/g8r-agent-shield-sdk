@@ -45,6 +45,7 @@ from .conftest import (
     CHECK_URL,
     CONSOLE_URL,
     LOG_URL,
+    PEP_URL,
     allowed_response,
     blocked_response,
     denied_registration_response,
@@ -115,6 +116,7 @@ class TestConstruction:
 
     def test_slots_declared_with_expected_fields(self):
         assert set(AgentShield.__slots__) == {
+            "_pep_url",
             "_console_url",
             "_api_key",
             "_credential_provider",
@@ -133,6 +135,33 @@ class TestConstruction:
 # ════════════════════════════════════════════════════════════════════════════
 # __repr__
 # ════════════════════════════════════════════════════════════════════════════
+
+
+
+class TestPepUrlFallback:
+    """pep_url is optional-with-fallback BY CONTRACT (v0.5.0): when absent, the
+    SDK warns and routes /proxy to console_url, so single-URL setups keep
+    working. This documented path had no coverage, which is exactly how the
+    fallback and 15 mock-strict tests drifted apart without anything failing."""
+
+    @responses.activate
+    def test_console_only_shield_routes_proxy_to_console(self):
+        responses.add(
+            responses.POST, f"{CONSOLE_URL}/proxy", json=allowed_response(), status=200
+        )
+        s = AgentShield(tenant_id="tenant-test", console_url=CONSOLE_URL, api_key="sk-test")
+        decision = s.check("Safe prompt", log=False)
+        assert decision.decision == "allowed"
+
+    def test_explicit_pep_url_wins_over_fallback(self):
+        s = AgentShield(
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
+            console_url=CONSOLE_URL,
+            api_key="sk-test",
+        )
+        assert s._pep_url == PEP_URL
+        assert s._console_url == CONSOLE_URL
 
 
 class TestRepr:
@@ -292,6 +321,37 @@ class TestWrap:
         assert esc_logs[0]["agent_id"] == shield._agent_id
         assert esc_logs[0]["log_level"] == "warning"
         assert "Destructive operation" in esc_logs[0]["reason"]
+
+    @responses.activate
+    def test_no_double_decide_single_pep_decision_only(self, shield, mocker):
+        """Verify wrap() calls PEP /proxy (not management API /check) — single decision point."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        factory = mocker.Mock(return_value="result")
+        shield.wrap(factory, "test prompt")
+
+        # Verify we called PEP /proxy (CHECK_URL points to PEP /proxy now)
+        urls = [call.request.url for call in responses.calls]
+        assert CHECK_URL in urls
+        # Verify we did NOT call management API /check
+        assert f"{CONSOLE_URL}/api/sdk/v1/check" not in urls
+        # Audit log is still allowed (adjunct only, no decision)
+        assert LOG_URL in urls
+        # Should be exactly 2 calls: PEP /proxy + audit log
+        assert len(responses.calls) == 2
+
+    @responses.activate
+    def test_pep_headers_included(self, shield):
+        """Verify X-GF-Tenant-ID and X-GF-Agent-ID headers are sent to PEP."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.check("test", log=False)
+
+        pep_call = responses.calls[0]
+        assert pep_call.request.headers["X-GF-Tenant-ID"] == "tenant-test"
+        assert pep_call.request.headers["X-GF-Agent-ID"] == "test-agent"
 
     @responses.activate
     def test_escalated_with_block_on_escalated_raises(self, strict_shield, mocker):
@@ -558,6 +618,7 @@ class TestPayloadShape:
 
         s = AgentShield(
             tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_999",
@@ -616,6 +677,7 @@ class TestPayloadShape:
     def test_check_payload_omits_employee_name_when_none(self):
         s = AgentShield(
             tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_x",
@@ -786,8 +848,10 @@ class TestShieldConnectionError:
         with pytest.raises(ShieldConnectionError) as exc_info:
             shield.check("test", log=False)
 
-        # Message names the console_url and the retry, but carries no body.
-        assert CONSOLE_URL in str(exc_info.value)
+        # v0.5.0: check() goes to the PEP, so the error names the PEP the caller
+        # must actually fix -- pointing an operator at the console for a PEP
+        # outage was the OLD contract and it was misleading.
+        assert PEP_URL in str(exc_info.value)
         assert "after retry" in str(exc_info.value)
 
     @responses.activate
@@ -921,6 +985,7 @@ class TestCredentialProvider:
     def _provider_shield(provider) -> AgentShield:
         return AgentShield(
             tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             credential_provider=provider,
         )
@@ -1148,7 +1213,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.4.0"
+    CANONICAL_VERSION = "0.5.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1157,6 +1222,7 @@ class TestCanonicalContract:
         params = {name for name in sig.parameters if name != "self"}
         assert params == {
             "tenant_id",
+            "pep_url",
             "console_url",
             "api_key",
             "department",
@@ -1294,6 +1360,7 @@ def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
     """Build a shield against the mock console with a given agent_id."""
     return AgentShield(
         tenant_id="tenant-test",
+        pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         agent_id=agent_id,

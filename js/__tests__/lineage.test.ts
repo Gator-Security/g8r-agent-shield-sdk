@@ -1,7 +1,7 @@
 /**
  * Sub-agent lineage tests.
  *
- * The 0.4.0 wire contract gained two optional, additive fields on /check and
+ * The 0.5.0 wire contract gained two optional, additive fields on PEP /proxy and
  * /log — `sessionId` (a stable id for one logical agent run) and
  * `parentAgents` (the ancestor agent-id chain, ROOT-first / immediate-parent
  * last). This suite pins how the SDK auto-propagates that lineage through
@@ -18,6 +18,7 @@ import { tenantId } from '../src/ids';
 import { getGovernanceContext, asyncContextIsolated } from '../src/context';
 
 const baseConfig = {
+  pepUrl: 'http://localhost:3000',
   consoleUrl: 'http://localhost:3000',
   apiKey: 'sk-test',
   tenantId: tenantId('acme-inc'),
@@ -39,11 +40,11 @@ const blocked = {
   complianceMappings: [],
 };
 
-/** URL-aware fetch mock: /check → the given decision, everything else → a log entry. */
+/** URL-aware fetch mock: /proxy → the given decision, everything else → a log entry. */
 function mockFetch(decision: unknown = allowed): void {
   global.fetch = jest.fn().mockImplementation((url: string) => {
-    const isCheck = String(url).endsWith('/check');
-    const body = isCheck ? decision : { id: 'log-entry', decision: 'allowed', timestamp: 't' };
+    const isProxy = String(url).endsWith('/proxy');
+    const body = isProxy ? decision : { id: 'log-entry', decision: 'allowed', timestamp: 't' };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -60,7 +61,7 @@ function bodiesFor(suffix: string): any[] {
     .map(([, init]) => JSON.parse(init.body));
 }
 
-const checkBodies = (): any[] => bodiesFor('/check');
+const checkBodies = (): any[] => bodiesFor('/proxy');
 const logBodies = (): any[] => bodiesFor('/log');
 
 /** Force a macrotask boundary so concurrent chains actually interleave. */

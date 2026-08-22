@@ -7,6 +7,7 @@ import {
 import { tenantId } from '../src/ids';
 
 const mockConfig = {
+  pepUrl: 'http://localhost:3000',
   consoleUrl: 'http://localhost:3000',
   apiKey: 'sk-shield-test-key',
   tenantId: tenantId('acme-inc'),
@@ -79,10 +80,12 @@ describe('AgentShield', () => {
 
     it('resolves consoleUrl and apiKey from env when omitted', async () => {
       process.env.G8R_CONSOLE_URL = 'https://env-console.example.com';
+      process.env.G8R_PEP_URL = 'https://env-pep.example.com';
       process.env.G8R_API_KEY = 'sk-from-env';
 
       const envShield = new AgentShield({
         ...mockConfig,
+        pepUrl: undefined,
         consoleUrl: undefined,
         apiKey: undefined,
       });
@@ -91,12 +94,15 @@ describe('AgentShield', () => {
       await envShield.check('hi', { log: false });
 
       const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('https://env-console.example.com/api/sdk/v1/check');
+      expect(url).toBe('https://env-pep.example.com/proxy');
       expect(init.headers.Authorization).toBe('Bearer sk-from-env');
+      expect(init.headers['X-GF-Tenant-ID']).toBe('acme-inc');
+      expect(init.headers['X-GF-Agent-ID']).toBe('test-agent');
     });
 
     it('prefers explicit args over env vars', async () => {
       process.env.G8R_CONSOLE_URL = 'https://env-console.example.com';
+      process.env.G8R_PEP_URL = 'https://env-pep.example.com';
       process.env.G8R_API_KEY = 'sk-from-env';
 
       const argShield = new AgentShield(mockConfig);
@@ -104,7 +110,7 @@ describe('AgentShield', () => {
       await argShield.check('hi', { log: false });
 
       const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('http://localhost:3000/proxy');
       expect(init.headers.Authorization).toBe('Bearer sk-shield-test-key');
     });
 
@@ -119,19 +125,20 @@ describe('AgentShield', () => {
       expect(global.fetch).not.toHaveBeenCalled();
     });
 
-    it('strips a trailing slash from consoleUrl', async () => {
+    it('strips a trailing slash from pepUrl', async () => {
       const slashShield = new AgentShield({
         ...mockConfig,
-        consoleUrl: 'http://localhost:3000/',
+        pepUrl: 'http://localhost:3000/',
       });
       mockCheckOnly(allowedResponse);
       await slashShield.check('hi', { log: false });
       const [url] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('http://localhost:3000/proxy');
     });
 
     it('applies field defaults (department/userId/aiModel/agentId) when omitted', async () => {
       const minimalShield = new AgentShield({
+        pepUrl: 'http://localhost:3000',
         consoleUrl: 'http://localhost:3000',
         apiKey: 'sk',
         tenantId: tenantId('acme-inc'),
@@ -164,17 +171,19 @@ describe('AgentShield', () => {
       expect(body.input).not.toContain('custodial-id:abc123xyz');
     });
 
-    it('sends correct request to /api/sdk/v1/check with User-Agent header', async () => {
+    it('sends correct request to PEP /proxy with required headers', async () => {
       mockCheckOnly(allowedResponse);
 
       const result = await shield.check('What is the weather?', { log: false });
 
       const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('http://localhost:3000/proxy');
       expect(init.method).toBe('POST');
       expect(init.headers['Content-Type']).toBe('application/json');
       expect(init.headers.Authorization).toBe('Bearer sk-shield-test-key');
       expect(init.headers['User-Agent']).toMatch(/^g8r-shield-typescript\/\d+\.\d+\.\d+$/);
+      expect(init.headers['X-GF-Tenant-ID']).toBe('acme-inc');
+      expect(init.headers['X-GF-Agent-ID']).toBe('test-agent');
       expect(result.decision).toBe('allowed');
     });
 
@@ -188,7 +197,7 @@ describe('AgentShield', () => {
 
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[0][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/check'
+        'http://localhost:3000/proxy'
       );
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
         'http://localhost:3000/api/sdk/v1/log'
@@ -343,7 +352,7 @@ describe('AgentShield', () => {
       expect(result).toEqual({ content: 'sunny' });
     });
 
-    it('makes exactly two HTTP calls (/check then /log) — no duplicate log', async () => {
+    it('makes exactly two HTTP calls (PEP /proxy then /log) — no duplicate log', async () => {
       mockFetchSequence([
         { ok: true, body: allowedResponse },
         { ok: true, body: { id: 'log-entry' } },
@@ -351,7 +360,7 @@ describe('AgentShield', () => {
       await shield.wrap(() => Promise.resolve('ok'), 'Safe query');
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[0][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/check'
+        'http://localhost:3000/proxy'
       );
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
         'http://localhost:3000/api/sdk/v1/log'
@@ -377,7 +386,7 @@ describe('AgentShield', () => {
       await expect(shield.wrap(() => Promise.resolve('x'), 'bad')).rejects.toThrow(
         ShieldBlockedError
       );
-      // /check + /log both fired even though the decision was blocked.
+      // PEP /proxy + /log both fired even though the decision was blocked.
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
         'http://localhost:3000/api/sdk/v1/log'
@@ -489,6 +498,21 @@ describe('AgentShield', () => {
         ShieldBlockedError
       );
       expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('does NOT call management API /check (single PEP decision only)', async () => {
+      mockFetchSequence([
+        { ok: true, body: allowedResponse },
+        { ok: true, body: { id: 'log-entry' } },
+      ]);
+      await shield.wrap(() => Promise.resolve('ok'), 'test');
+      
+      // Verify we call PEP /proxy (not management API /check)
+      const urls = (global.fetch as jest.Mock).mock.calls.map(([url]) => url);
+      expect(urls).toContain('http://localhost:3000/proxy');
+      expect(urls).not.toContain('http://localhost:3000/api/sdk/v1/check');
+      // Audit log is still allowed (adjunct only, no decision)
+      expect(urls).toContain('http://localhost:3000/api/sdk/v1/log');
     });
 
     it('sends a REDACTED prompt to /log (audit path must not leak raw secrets)', async () => {

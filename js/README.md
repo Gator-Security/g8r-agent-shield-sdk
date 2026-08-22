@@ -21,6 +21,7 @@ import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   tenantId: tenantId('acme-corp'),        // the only hard-required field
+  pepUrl: 'https://pep.yourcompany.com',  // PEP endpoint (or G8R_PEP_URL env var)
   consoleUrl: 'https://shield.yourcompany.com', // or G8R_CONSOLE_URL env var
   apiKey: 'sk-shield-...',                // or G8R_API_KEY env var
   agentId: 'enterprise-assistant',        // optional — defaults to 'sdk-client'
@@ -36,10 +37,11 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default — a per-instance default [session](#sub-agent-lineage) that, when omitted, means `wrap()` mints a fresh session per top-level call and a bare `check()` sends none (backward-compatible).
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `pepUrl` is **required for correct operation**: resolved from this field OR the `G8R_PEP_URL` env var. If neither is present, the constructor falls back to `consoleUrl` (for backward compatibility) but warns. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default — a per-instance default [session](#sub-agent-lineage) that, when omitted, means `wrap()` mints a fresh session per top-level call and a bare `check()` sends none (backward-compatible).
 
 ```typescript
-// Minimal — consoleUrl + apiKey from env, everything else defaulted:
+// Minimal — pepUrl, consoleUrl + apiKey from env, everything else defaulted:
+//   export G8R_PEP_URL=https://pep.yourcompany.com
 //   export G8R_CONSOLE_URL=https://shield.yourcompany.com
 //   export G8R_API_KEY=sk-shield-...
 const shield = new AgentShield({ tenantId: tenantId('acme-corp') });
@@ -98,11 +100,15 @@ An admin-**denied** agent returns `blocked` with `requiresApproval: false` in bo
 The primary integration point. Runs the full pipeline:
 
 1. **Redact** — `redactSensitiveData(prompt)` strips secrets locally
-2. **Check** — POST redacted prompt to `/api/sdk/v1/check` (policy evaluation)
-3. **Log** — POST audit entry to `/api/sdk/v1/log`
+2. **Check** — POST redacted prompt to PEP `/proxy` (single policy decision point)
+3. **Log** — POST audit entry to `/api/sdk/v1/log` (adjunct only, no decision)
 4. **Invoke** — call `factory()` only if decision is `allowed`, or `escalated` while `blockOnEscalated` is `false`
 
-If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` runs the `/check` evaluation and then a single `/log`, both under one `requestId` and one resolved [lineage](#sub-agent-lineage), so `/check` and `/log` correlate under a single id with no duplicate audit entry. When allowed (or escalated-and-proceeding), the factory runs inside an ambient scope so nested `wrap()` calls inherit the session and parent-agent chain automatically.
+**Important: Single Decision Point Rule**
+
+The SDK enforces the **one-hop rule**: policy decisions come from **PEP `/proxy` only**. The factory function is invoked after the PEP decision allows it, but the factory itself should **not** make a second policy check. The management API `/log` endpoint is used for audit trail (adjunct function), never for blocking decisions.
+
+If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` runs the PEP evaluation and then a single `/log`, both under one `requestId` and one resolved [lineage](#sub-agent-lineage), so the PEP check and audit log correlate under a single id with no duplicate audit entry. When allowed (or escalated-and-proceeding), the factory runs inside an ambient scope so nested `wrap()` calls inherit the session and parent-agent chain automatically.
 
 ```typescript
 try {

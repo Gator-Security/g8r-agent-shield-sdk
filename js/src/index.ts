@@ -53,7 +53,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -72,6 +72,7 @@ const RETRY_BACKOFF_MS = 500;
 /** Environment variable fallbacks for deployment config (12-factor). */
 const ENV_CONSOLE_URL = 'G8R_CONSOLE_URL';
 const ENV_API_KEY = 'G8R_API_KEY';
+const ENV_PEP_URL = 'G8R_PEP_URL';
 
 // ── Field defaults ────────────────────────────────────────────────────────────
 // Defaulted-not-required fields. Attribution labels that degrade an audit trail
@@ -84,6 +85,14 @@ const DEFAULT_AGENT_ID = 'sdk-client';
 const DEFAULT_TIMEOUT_SECONDS = 10.0;
 
 export interface ShieldConfig {
+  /**
+   * Base URL of the Policy Enforcement Point (PEP) that makes policy decisions
+   * and proxies allowed requests to the model. Required: resolved from this
+   * field OR the `G8R_PEP_URL` env var. If neither is present, the constructor
+   * derives it from consoleUrl (for backward compatibility) but warns. Never
+   * defaults to localhost. A trailing slash is stripped.
+   */
+  pepUrl?: string;
   /**
    * Base URL of the deployed G8R Console. Optional at the type level, but
    * effectively required: resolved from this field OR the `G8R_CONSOLE_URL`
@@ -237,6 +246,7 @@ interface RequestLineage {
 }
 
 export class AgentShield {
+  private readonly pepUrl: string;
   private readonly consoleUrl: string;
   private readonly credential: () => string | Promise<string>;
   private readonly tenantId: TenantId;
@@ -258,12 +268,26 @@ export class AgentShield {
     // Resolve deployment config from arg-or-env. Fail closed if unresolvable —
     // never fall back to localhost, which would silently exfiltrate customer
     // prompts + API keys to whatever is bound on 127.0.0.1 in the runtime.
-    const resolvedUrl = config.consoleUrl || readEnv(ENV_CONSOLE_URL);
-    if (!resolvedUrl) {
+    const resolvedConsoleUrl = config.consoleUrl || readEnv(ENV_CONSOLE_URL);
+    if (!resolvedConsoleUrl) {
       throw new Error(
         `consoleUrl is required. Pass consoleUrl or set the ${ENV_CONSOLE_URL} env var. ` +
           'An SDK that ships customer prompts and API keys must never default to localhost.'
       );
+    }
+
+    // Resolve PEP URL from arg-or-env, with consoleUrl as fallback for
+    // backward compatibility (but warn that explicit pepUrl is required going
+    // forward).
+    const resolvedPepUrl = config.pepUrl || readEnv(ENV_PEP_URL);
+    if (!resolvedPepUrl) {
+      log.warn('pep_url_missing', {
+        message:
+          'pepUrl not configured; falling back to consoleUrl. Set G8R_PEP_URL or pass pepUrl explicitly.',
+      });
+      this.pepUrl = resolvedConsoleUrl.replace(/\/+$/, '');
+    } else {
+      this.pepUrl = resolvedPepUrl.replace(/\/+$/, '');
     }
 
     // A static key and a per-request provider are two mutually exclusive
@@ -297,7 +321,7 @@ export class AgentShield {
 
     // Store all fields (with defaults applied) as write-once instance state.
     // The instance holds no mutable state and is safe to share across loops.
-    this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
+    this.consoleUrl = resolvedConsoleUrl.replace(/\/+$/, ''); // strip trailing slash(es)
     this.credential = credential;
     this.tenantId = config.tenantId;
     this.department = config.department ?? DEFAULT_DEPARTMENT;
@@ -320,7 +344,8 @@ export class AgentShield {
    */
   toString(): string {
     return (
-      `AgentShield(consoleUrl=${JSON.stringify(this.consoleUrl)}, ` +
+      `AgentShield(pepUrl=${JSON.stringify(this.pepUrl)}, ` +
+      `consoleUrl=${JSON.stringify(this.consoleUrl)}, ` +
       `tenantId=${JSON.stringify(this.tenantId)}, ` +
       `agentId=${JSON.stringify(this.agentId)}, department=${JSON.stringify(this.department)})`
     );
@@ -540,10 +565,11 @@ export class AgentShield {
   }
 
   /**
-   * POST the redacted prompt + governance fields to /api/sdk/v1/check and parse
-   * the decision. Retries exactly once on a transient connection/timeout error
-   * after a short backoff, then raises ShieldConnectionError. Non-2xx responses
-   * raise ShieldConsoleError, whose message never carries the raw body.
+   * POST the redacted prompt + governance fields to PEP /proxy and parse
+   * the decision. This is the SINGLE policy decision point. Retries exactly
+   * once on a transient connection/timeout error after a short backoff, then
+   * raises ShieldConnectionError. Non-2xx responses raise ShieldConsoleError,
+   * whose message never carries the raw body.
    */
   private async evaluate(
     prompt: string,
@@ -564,7 +590,7 @@ export class AgentShield {
     // and a JWT valid at request start is still valid one backoff later.
     const credential = await this.resolveCredential();
 
-    const url = `${this.consoleUrl}/api/sdk/v1/check`;
+    const url = `${this.pepUrl}/proxy`;
     const body = JSON.stringify({
       input: redacted, // send the redacted version — never the raw prompt
       tenantId: this.tenantId,
@@ -590,6 +616,8 @@ export class AgentShield {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${credential}`,
             'User-Agent': SDK_USER_AGENT,
+            'X-GF-Tenant-ID': this.tenantId,
+            'X-GF-Agent-ID': this.agentId,
           },
           body,
           signal: AbortSignal.timeout(this.timeoutMs),
@@ -603,15 +631,15 @@ export class AgentShield {
           await delay(RETRY_BACKOFF_MS);
           continue;
         }
-        scopedLog.error('Console unreachable', { url: this.consoleUrl });
-        throw new ShieldConnectionError(this.consoleUrl, err);
+        scopedLog.error('PEP unreachable', { url: this.pepUrl });
+        throw new ShieldConnectionError(this.pepUrl, err);
       }
     }
 
     // Unreachable in practice (loop either breaks with `res` set or throws), but
     // keeps the type checker honest.
     if (!res) {
-      throw new ShieldConnectionError(this.consoleUrl);
+      throw new ShieldConnectionError(this.pepUrl);
     }
 
     if (!res.ok) {

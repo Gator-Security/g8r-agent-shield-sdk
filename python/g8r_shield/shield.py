@@ -283,7 +283,7 @@ class AgentShield:
 
     Every call to ``wrap()`` will:
 
-    1. POST the prompt to ``/api/sdk/v1/check`` for policy evaluation.
+    1. POST the prompt to PEP ``/proxy`` for policy evaluation.
     2. Record the interaction in the audit trail via ``/api/sdk/v1/log``.
     3. Raise ``ShieldBlockedError`` if blocked (or if escalated and
        ``block_on_escalated=True``).
@@ -298,6 +298,10 @@ class AgentShield:
         tenant_id: The one hard-required field — identifies the tenant in the
             multi-tenant plane. Must be a non-empty string. No env fallback:
             tenant is call-site identity, not deployment config.
+        pep_url: Base URL of the Policy Enforcement Point (PEP) that makes
+            policy decisions. Required: resolved from this argument OR the
+            ``G8R_PEP_URL`` env var. If neither is present, falls back to
+            console_url (with a warning). Never defaults to localhost.
         console_url: Base URL of your deployed G8R Console. Required in effect,
             but resolved from this argument OR the ``G8R_CONSOLE_URL`` env var;
             construction fails if neither is set. Never defaults to localhost.
@@ -340,6 +344,7 @@ class AgentShield:
     """
 
     __slots__ = (
+        "_pep_url",
         "_console_url",
         "_api_key",
         "_credential_provider",
@@ -358,6 +363,7 @@ class AgentShield:
         self,
         *,
         tenant_id: str,
+        pep_url: str | None = None,
         console_url: str | None = None,
         api_key: str | None = None,
         department: str = "General",
@@ -378,15 +384,28 @@ class AgentShield:
         if not tenant_id:
             raise ValueError("tenant_id is required")
 
-        resolved_url = console_url or os.environ.get("G8R_CONSOLE_URL")
-        if not resolved_url:
+        resolved_console_url = console_url or os.environ.get("G8R_CONSOLE_URL")
+        if not resolved_console_url:
             raise ValueError(
                 "console_url is required. Pass console_url=... or set the G8R_CONSOLE_URL env var. "
                 "An SDK that ships customer prompts and API keys must never default to localhost — "
                 "a misconfigured agent would silently exfiltrate to whatever happens to be bound on "
                 "127.0.0.1 in the runtime environment."
             )
-        self._console_url = resolved_url.rstrip("/")
+        self._console_url = resolved_console_url.rstrip("/")
+
+        # Resolve PEP URL from arg-or-env, with console_url as fallback for
+        # backward compatibility (but warn that explicit pep_url is required
+        # going forward).
+        resolved_pep_url = pep_url or os.environ.get("G8R_PEP_URL")
+        if not resolved_pep_url:
+            _LOGGER.warning(
+                "pep_url_missing",
+                message="pep_url not configured; falling back to console_url. Set G8R_PEP_URL or pass pep_url explicitly.",
+            )
+            self._pep_url = self._console_url
+        else:
+            self._pep_url = resolved_pep_url.rstrip("/")
 
         if credential_provider is not None and api_key is not None:
             # Two explicit credential sources is a config bug, not a
@@ -424,7 +443,8 @@ class AgentShield:
         # Deliberately omits api_key — never expose it in logs or repr output.
         # tenant_id is not secret; include it for operational clarity.
         return (
-            f"AgentShield(console_url={self._console_url!r}, "
+            f"AgentShield(pep_url={self._pep_url!r}, "
+            f"console_url={self._console_url!r}, "
             f"tenant_id={self._tenant_id!r}, "
             f"agent_id={self._agent_id!r}, department={self._department!r})"
         )
@@ -730,7 +750,7 @@ class AgentShield:
         # the process — the gateway only ever sees the redacted form. Parity
         # with the TypeScript SDK's check() path.
         redaction = redact_sensitive_data(prompt)
-        url = f"{self._console_url}/api/sdk/v1/check"
+        url = f"{self._pep_url}/proxy"
         # Annotated as `dict[str, str | bytes]` — `requests.post`'s
         # `headers` parameter is typed as `MutableMapping[str, str | bytes]`
         # under mypy 2.1+ with the latest `types-requests` stubs.
@@ -749,6 +769,8 @@ class AgentShield:
             "Authorization": f"Bearer {self._bearer_credential()}",
             "Content-Type": "application/json",
             "User-Agent": _SDK_USER_AGENT,
+            "X-GF-Tenant-ID": self._tenant_id,
+            "X-GF-Agent-ID": self._agent_id,
         }
         # NOTE: employeeName is deliberately NOT sent on /check. It is an
         # audit-trail label that belongs only on /log (where it falls back to
@@ -786,8 +808,8 @@ class AgentShield:
                 # apart from "the server said no" (ShieldConsoleError).
                 # Subclasses RuntimeError, so existing catch-alls still fire.
                 raise ShieldConnectionError(
-                    f"[G8R Shield] Could not connect to console at {self._console_url} "
-                    f"after retry. Is the console running?"
+                    f"[G8R Shield] Could not connect to PEP at {self._pep_url} "
+                    f"after retry. Is the PEP running?"
                 ) from exc
             except requests.exceptions.HTTPError as exc:
                 # `response` is bound when raise_for_status fires. The raw
@@ -805,7 +827,7 @@ class AgentShield:
         # appease the type checker for the case where the loop body changes.
         if response is None:
             raise ShieldConnectionError(
-                f"[G8R Shield] Could not connect to console at {self._console_url}"
+                f"[G8R Shield] Could not connect to PEP at {self._pep_url}"
             ) from last_exc
 
         data = response.json()

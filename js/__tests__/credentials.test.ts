@@ -89,7 +89,7 @@ describe('credentialProvider', () => {
 
       expect(provider).toHaveBeenCalledTimes(2);
       const calls = (global.fetch as jest.Mock).mock.calls;
-      expect(calls[0][0]).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(calls[0][0]).toBe('http://localhost:3000/proxy');
       expect(calls[0][1].headers.Authorization).toBe('Bearer jwt-1');
       expect(calls[1][0]).toBe('http://localhost:3000/api/sdk/v1/log');
       expect(calls[1][1].headers.Authorization).toBe('Bearer jwt-2');
