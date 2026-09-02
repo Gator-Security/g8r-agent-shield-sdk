@@ -9,7 +9,7 @@ Usage:
 
     shield = AgentShield(
         tenant_id="demo-tenant",
-        console_url="https://your-console.railway.app",
+        console_url="https://shield.yourcompany.com",
         api_key="sk-shield-your-key",
         department="Legal",
         user_id="usr_001",

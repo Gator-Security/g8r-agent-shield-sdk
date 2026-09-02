@@ -5,7 +5,7 @@ Install:
     pip install g8r-shield boto3
 
 Run:
-    AWS_REGION=us-east-1 G8R_CONSOLE_URL=https://your-console.railway.app \
+    AWS_REGION=us-east-1 G8R_CONSOLE_URL=https://shield.yourcompany.com \
     G8R_API_KEY=sk-shield-your-key python example_bedrock.py
 """
 

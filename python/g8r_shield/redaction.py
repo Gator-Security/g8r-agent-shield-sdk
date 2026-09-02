@@ -1,9 +1,11 @@
 """
 local-first VPC sensitive-data redaction.
 
-Redacts cryptographic keys, custodial identifiers, and high-entropy strings
-BEFORE prompts reach the G8R policy gateway — a local-first redaction layer.
-This is the Python parity port of the TypeScript SDK's ``redaction.ts``.
+Redacts cryptographic keys, custodial identifiers, common PII (Luhn cards,
+SSNs, emails, phones), and high-entropy strings BEFORE prompts reach the
+G8R policy gateway. Python parity of the TypeScript SDK's ``redaction.ts``.
+
+This is defense-in-depth, not a completeness guarantee.
 
 Compliance:
   - GDPR Art. 32: Security of Processing — appropriate technical measures.
@@ -68,8 +70,31 @@ _CUST_PATTERN = re.compile(r"\bcust-\d+\b", re.IGNORECASE)
 _WALLET_ID_PATTERN = re.compile(r"\bwallet-id:[A-Za-z0-9_-]+\b")
 _VAULT_ID_PATTERN = re.compile(r"\bvault-id:[A-Za-z0-9_-]+\b")
 
+# ── PII patterns (best-effort; same shapes as js/src/redaction.ts) ────────────
+
+_EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_SSN_PATTERN = re.compile(r"\b\d{3}[ -]\d{2}[ -]\d{4}\b")
+_PHONE_PATTERN = re.compile(r"\b(?:\+?\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}\b")
+# 13–19 digits with optional single space/hyphen separators; Luhn-gated below.
+_CARD_CANDIDATE_PATTERN = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Luhn checksum — only mask digit runs that pass the check digit."""
+    total = 0
+    double = False
+    for ch in reversed(digits):
+        d = ord(ch) - 48
+        if double:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        double = not double
+    return total % 10 == 0
+
 #: Labelled patterns applied in order. PEM first so its multi-line body is
-#: not split on inner patterns; custodial ids before the high-entropy
+#: not split on inner patterns; custodial ids before PII and the high-entropy
 #: catch-all.
 _LABELLED_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (_PEM_PATTERN, "PEM_KEY"),
@@ -113,12 +138,33 @@ def redact_sensitive_data(value: str) -> RedactionResult:
 
     Processing order — PEM blocks first (so the body is not split on inner
     patterns), then BIP-32 / WIF / raw-hex keys, then the four custodial-id
-    variants, then a high-entropy catch-all run on the already-redacted text.
+    variants, then PII (Luhn cards, SSN, email, phone), then a high-entropy
+    catch-all on the already-redacted text.
     """
     tokens_replaced: list[str] = []
     redacted = value
 
     for pattern, label in _LABELLED_PATTERNS:
+        matches = [match.group(0) for match in pattern.finditer(redacted)]
+        if not matches:
+            continue
+        tokens_replaced.extend(matches)
+        redacted = pattern.sub(f"[REDACTED:{label}]", redacted)
+
+    def _card_sub(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        if 13 <= len(digits) <= 19 and _luhn_valid(digits):
+            tokens_replaced.append(raw)
+            return "[REDACTED:CARD]"
+        return raw
+
+    redacted = _CARD_CANDIDATE_PATTERN.sub(_card_sub, redacted)
+    for pattern, label in (
+        (_SSN_PATTERN, "SSN"),
+        (_EMAIL_PATTERN, "EMAIL"),
+        (_PHONE_PATTERN, "PHONE"),
+    ):
         matches = [match.group(0) for match in pattern.finditer(redacted)]
         if not matches:
             continue
