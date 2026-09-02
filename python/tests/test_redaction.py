@@ -86,6 +86,36 @@ class TestRedactSensitiveData:
         result = redact_sensitive_data("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         assert result.tokens_replaced == []
 
+    def test_redacts_luhn_card_spaced(self):
+        result = redact_sensitive_data("card 4111 1111 1111 1111 on file")
+        assert "[REDACTED:CARD]" in result.redacted
+        assert "4111 1111 1111 1111" not in result.redacted
+        assert "4111 1111 1111 1111" in result.tokens_replaced
+
+    def test_redacts_luhn_card_contiguous(self):
+        result = redact_sensitive_data("pan 4111111111111111")
+        assert "[REDACTED:CARD]" in result.redacted
+
+    def test_does_not_redact_non_luhn_digit_run(self):
+        result = redact_sensitive_data("order 4111111111111112 shipped")
+        assert "[REDACTED:CARD]" not in result.redacted
+        assert "4111111111111112" not in result.tokens_replaced
+
+    def test_redacts_us_ssn(self):
+        result = redact_sensitive_data("ssn 123-45-6789")
+        assert "[REDACTED:SSN]" in result.redacted
+        assert "123-45-6789" in result.tokens_replaced
+
+    def test_redacts_email(self):
+        result = redact_sensitive_data("contact john.doe@acme.com please")
+        assert "[REDACTED:EMAIL]" in result.redacted
+        assert "john.doe@acme.com" not in result.redacted
+
+    def test_redacts_separated_phone(self):
+        result = redact_sensitive_data("call 415-555-0199 today")
+        assert "[REDACTED:PHONE]" in result.redacted
+        assert "415-555-0199" not in result.redacted
+
 
 class TestAgentShieldRedaction:
     @responses.activate
