@@ -133,17 +133,18 @@ def test_high_entropy_secrets_are_stripped_before_evaluation():
     assert "transfer_funds" in sent, "the action itself still has to be judgeable"
 
 
-def test_pii_is_deliberately_preserved_for_the_detectors():
-    """NOT a redaction gap — a design constraint.
+def test_pii_is_stripped_before_evaluation_like_wrap():
+    """Parity with wrap() / TypeScript: SSN/email/card never leave the process.
 
-    ``input`` is documented as "redacted by the SDK client; scanned by PDP detectors". If the
-    client stripped PII too, the server could never fire PACK_PII_EGRESS and the whole
-    PII-to-egress control would be unenforceable. Secrets are stripped; PII is passed for
-    evaluation and kept out of the audit body server-side.
+    PACK_PII_EGRESS on the PDP is a PEP/gateway control (raw prompt at the hop).
+    SDK clients redact PII locally first; the action name stays judgeable.
     """
     shield = _FakeShield()
     _call(ShieldPlugin(shield), shield, args={"note": "ssn 578-14-1830"})
-    assert "578-14-1830" in shield.checked[0]
+    sent = shield.checked[0]
+    assert "578-14-1830" not in sent
+    assert "[REDACTED:SSN]" in sent
+    assert "transfer_funds" in sent
 
 
 def test_redaction_can_be_disabled():
