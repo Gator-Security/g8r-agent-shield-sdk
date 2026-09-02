@@ -9,6 +9,7 @@ Usage:
 
     shield = AgentShield(
         tenant_id="demo-tenant",
+        pep_url="https://pep.yourcompany.com",
         console_url="https://shield.yourcompany.com",
         api_key="sk-shield-your-key",
         department="Legal",

@@ -5,7 +5,8 @@ Install:
     pip install g8r-shield boto3
 
 Run:
-    AWS_REGION=us-east-1 G8R_CONSOLE_URL=https://shield.yourcompany.com \
+    AWS_REGION=us-east-1 G8R_PEP_URL=https://pep.yourcompany.com \
+    G8R_CONSOLE_URL=https://shield.yourcompany.com \
     G8R_API_KEY=sk-shield-your-key python example_bedrock.py
 """
 
@@ -17,6 +18,7 @@ from g8r_shield import AgentShield, ShieldBlockedError
 # ── Shield ───────────────────────────────────────────────────────────────────
 shield = AgentShield(
     tenant_id=os.environ.get("G8R_TENANT_ID", "demo-tenant"),
+    pep_url=os.environ["G8R_PEP_URL"],
     console_url=os.environ["G8R_CONSOLE_URL"],
     api_key=os.environ["G8R_API_KEY"],
     department="Legal",

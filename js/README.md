@@ -21,7 +21,8 @@ import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
   tenantId: tenantId('acme-corp'),        // the only hard-required field
-  consoleUrl: 'https://shield.yourcompany.com', // or G8R_CONSOLE_URL env var
+  pepUrl: 'https://pep.yourcompany.com',  // or G8R_PEP_URL — required, no localhost
+  consoleUrl: 'https://shield.yourcompany.com', // or G8R_CONSOLE_URL (audit /log)
   apiKey: 'sk-shield-...',                // or G8R_API_KEY env var
   agentId: 'enterprise-assistant',        // optional — defaults to 'sdk-client'
   department: 'Finance',                  // optional — defaults to 'General'
@@ -36,7 +37,7 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** field — it identifies the tenant in the multi-tenant governance plane. `consoleUrl` and `apiKey` are **required-in-effect**: pass them directly, or omit them and let the constructor resolve them from the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither the argument nor the env var resolves, the constructor **throws** — it never falls back to `localhost` (an SDK that ships prompts + API keys must fail closed). The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default — a per-instance default [session](#sub-agent-lineage) that, when omitted, means `wrap()` mints a fresh session per top-level call and a bare `check()` sends none (backward-compatible).
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** identity field. `pepUrl` is **required-in-effect** (`G8R_PEP_URL`); wrap() hops `POST {pepUrl}/decide` with **no** `consoleUrl` fallback and loopback refused. `consoleUrl` / `apiKey` are required-in-effect for audit `/log` and the `check()` gap (`G8R_CONSOLE_URL` / `G8R_API_KEY`). The constructor **throws** rather than defaulting to localhost. The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default.
 
 ```typescript
 // Minimal — consoleUrl + apiKey from env, everything else defaulted:

@@ -44,6 +44,41 @@ _SDK_USER_AGENT = f"g8r-shield-python/{_SDK_VERSION}"
 # so it doesn't add user-visible latency on the happy path or on hard failures.
 _RETRY_BACKOFF_SECONDS = 0.5
 
+_ENV_PEP_URL = "G8R_PEP_URL"
+_ENV_CONSOLE_URL = "G8R_CONSOLE_URL"
+
+# wrap() hops PEP POST /decide (the SDK facade on the same gateway as /proxy).
+# /proxy forwards to a downstream URL; wrap() is decide-then-factory, so /decide
+# is the one-hop policy path. Output post-hook stays PEP's job on /proxy.
+_PEP_DECIDE_PATH = "/decide"
+
+_OUTCOME_TO_DECISION = {
+    "ALLOW": "allowed",
+    "DENY": "blocked",
+    "REQUIRE_APPROVAL": "escalated",
+    "ERROR": "blocked",
+}
+
+
+def _reject_loopback(url: str, field: str) -> str:
+    """Strip trailing slash; refuse empty and loopback targets."""
+    cleaned = url.strip().rstrip("/")
+    if not cleaned:
+        raise ValueError(f"{field} is required")
+    host = cleaned.lower()
+    if (
+        "://localhost" in host
+        or "://127.0.0.1" in host
+        or "://[::1]" in host
+        or host.startswith("localhost")
+        or host.startswith("127.0.0.1")
+    ):
+        raise ValueError(
+            f"{field} must not target localhost. An SDK that ships prompts must "
+            "fail closed rather than silently talk to 127.0.0.1."
+        )
+    return cleaned
+
 
 # ── Ambient governance context (sub-agent lineage) ──────────────────────────
 # Lineage — the session a call belongs to, plus the chain of agents above it —
@@ -283,12 +318,18 @@ class AgentShield:
 
     Every call to ``wrap()`` will:
 
-    1. POST the prompt to ``/api/sdk/v1/check`` for policy evaluation.
-    2. Record the interaction in the audit trail via ``/api/sdk/v1/log``.
-    3. Raise ``ShieldBlockedError`` if blocked (or if escalated and
+    1. Redact the prompt locally (secrets/PII never leave the process raw).
+    2. POST the redacted prompt to PEP ``/decide`` — the one policy hop.
+       ``check()`` still hits Console ``/api/sdk/v1/check`` (the documented gap);
+       wrap() does not.
+    3. Record the interaction in the audit trail via Console ``/api/sdk/v1/log``
+       (adjunct; never a second decision).
+    4. Raise ``ShieldBlockedError`` if blocked (or if escalated and
        ``block_on_escalated=True``).
-    4. Execute the factory callable and return its result if allowed
+    5. Execute the factory callable and return its result if allowed
        (or if escalated and ``block_on_escalated=False``, the default).
+       wrap() does not post-process the factory output — output governance is
+       PEP ``/proxy``'s job.
 
     Instances are configured once at construction and are intended to be
     shared across threads / agent loops. All fields are write-once (enforced
@@ -298,9 +339,13 @@ class AgentShield:
         tenant_id: The one hard-required field — identifies the tenant in the
             multi-tenant plane. Must be a non-empty string. No env fallback:
             tenant is call-site identity, not deployment config.
-        console_url: Base URL of your deployed G8R Console. Required in effect,
-            but resolved from this argument OR the ``G8R_CONSOLE_URL`` env var;
-            construction fails if neither is set. Never defaults to localhost.
+        pep_url: Base URL of the PEP gateway. Required: this argument OR
+            ``G8R_PEP_URL``. No ``console_url`` fallback. Loopback is refused.
+            wrap() hops ``POST {pep_url}/decide``.
+        console_url: Base URL of your deployed G8R Console (audit ``/log`` and
+            the ``check()`` gap). Required in effect, but resolved from this
+            argument OR the ``G8R_CONSOLE_URL`` env var; construction fails if
+            neither is set. Never defaults to localhost.
         api_key: Bearer token for the SDK check/log endpoints — the STATIC
             credential path (deployment shared secret). Required in effect
             unless ``credential_provider`` is supplied; resolved from this
@@ -340,6 +385,7 @@ class AgentShield:
     """
 
     __slots__ = (
+        "_pep_url",
         "_console_url",
         "_api_key",
         "_credential_provider",
@@ -358,6 +404,7 @@ class AgentShield:
         self,
         *,
         tenant_id: str,
+        pep_url: str | None = None,
         console_url: str | None = None,
         api_key: str | None = None,
         department: str = "General",
@@ -378,7 +425,7 @@ class AgentShield:
         if not tenant_id:
             raise ValueError("tenant_id is required")
 
-        resolved_url = console_url or os.environ.get("G8R_CONSOLE_URL")
+        resolved_url = console_url or os.environ.get(_ENV_CONSOLE_URL)
         if not resolved_url:
             raise ValueError(
                 "console_url is required. Pass console_url=... or set the G8R_CONSOLE_URL env var. "
@@ -386,7 +433,15 @@ class AgentShield:
                 "a misconfigured agent would silently exfiltrate to whatever happens to be bound on "
                 "127.0.0.1 in the runtime environment."
             )
-        self._console_url = resolved_url.rstrip("/")
+        self._console_url = resolved_url.strip().rstrip("/")
+
+        resolved_pep = pep_url or os.environ.get(_ENV_PEP_URL)
+        if not resolved_pep:
+            raise ValueError(
+                "pep_url is required. Pass pep_url=... or set the G8R_PEP_URL env var. "
+                "wrap() hops the PEP; there is no console_url fallback and no localhost default."
+            )
+        self._pep_url = _reject_loopback(resolved_pep, "pep_url")
 
         if credential_provider is not None and api_key is not None:
             # Two explicit credential sources is a config bug, not a
@@ -424,7 +479,8 @@ class AgentShield:
         # Deliberately omits api_key — never expose it in logs or repr output.
         # tenant_id is not secret; include it for operational clarity.
         return (
-            f"AgentShield(console_url={self._console_url!r}, "
+            f"AgentShield(pep_url={self._pep_url!r}, "
+            f"console_url={self._console_url!r}, "
             f"tenant_id={self._tenant_id!r}, "
             f"agent_id={self._agent_id!r}, department={self._department!r})"
         )
@@ -535,12 +591,9 @@ class AgentShield:
             _GovernanceContext(session_id=session, agent_chain=parent_agents)
         )
         try:
-            # Reuse the PUBLIC check() path with logging suppressed. Suppressing
-            # the log here (rather than letting check() log) avoids a duplicate
-            # audit entry — wrap() writes exactly one /log line, explicitly,
-            # below. This keeps a single call graph (check → log) for both
-            # check() and wrap().
-            decision = self.check(prompt, request_id=request_id, log=False)
+            # One PEP hop. Do NOT call check() — that POSTs Console /check on
+            # the same prompt (the gap wrap() exists to close).
+            decision = self._evaluate_pep(prompt, request_id=request_id)
 
             # Audit-log the attempt regardless of decision so it appears in the
             # Console audit trail. Done before enforcement so blocked decisions
@@ -824,6 +877,106 @@ class AgentShield:
             violated_rule=data.get("violatedRule"),
             requires_approval=data.get("requiresApproval", False),
             session_revoked=data.get("sessionRevoked", False),
+            compliance_mappings=mappings,
+            redacted_tokens=redaction.tokens_replaced,
+        )
+
+    def _evaluate_pep(self, prompt: str, request_id: str) -> PolicyDecision:
+        """One-hop policy evaluation at PEP POST /decide. Fail-closed on miss."""
+        redaction = redact_sensitive_data(prompt)
+        url = f"{self._pep_url}{_PEP_DECIDE_PATH}"
+        lineage = self._lineage_fields()
+        headers: dict[str, str | bytes] = {
+            "Authorization": f"Bearer {self._bearer_credential()}",
+            "Content-Type": "application/json",
+            "User-Agent": _SDK_USER_AGENT,
+            "X-GF-Tenant-ID": self._tenant_id,
+            "X-GF-Agent-ID": self._agent_id,
+        }
+        parents = lineage.get("parentAgents") or []
+        if parents:
+            # SDK chain is root-first, immediate parent last. PEP x-gf-agent-chain
+            # is nearest-parent-first.
+            headers["x-gf-agent-chain"] = ",".join(reversed(list(parents)))
+            headers["x-gf-parent-agent-id"] = parents[-1]
+        session = lineage.get("sessionId")
+        if session:
+            headers["x-gf-session-id"] = str(session)
+        payload: dict[str, Any] = {
+            "downstream_url": "sdk://wrap",
+            "method": "POST",
+            "action_hint": "llm_prompt",
+            "target_hint": "llm_prompt",
+            "body": {"prompt": redaction.redacted},
+            "correlation_id": request_id,
+            "action_type": "tool_call",
+            # Additive lineage (headers are what PEP /decide reads; these
+            # fields are ignored by ProxyRequest and kept for wrap() tests /
+            # operators inspecting the hop). GATE stays advisory.
+            **lineage,
+        }
+
+        response = None
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=self._timeout)
+                response.raise_for_status()
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise ShieldConnectionError(
+                    f"[G8R Shield] Could not connect to PEP at {self._pep_url} "
+                    f"after retry. Is the PEP running?"
+                ) from exc
+            except requests.exceptions.HTTPError as exc:
+                status = response.status_code if response is not None else "?"
+                body = response.text if response is not None else ""
+                raise ShieldConsoleError(status, body) from exc
+
+        if response is None:
+            raise ShieldConnectionError(
+                f"[G8R Shield] Could not connect to PEP at {self._pep_url}"
+            ) from last_exc
+
+        data = response.json() if response.content else {}
+        raw_decision = data.get("decision")
+        # Live PEP /decide: {decision: {outcome, reason_code, ...}}. A string
+        # `decision` is the Console /check shape — wrap() must not depend on it.
+        if isinstance(raw_decision, dict):
+            inner = raw_decision
+            outcome = str(inner.get("outcome") or "").upper()
+            mapped = _OUTCOME_TO_DECISION.get(outcome, "blocked")
+            reason_code = str(inner.get("reason_code") or "")
+            reason = str(inner.get("explanation") or reason_code or "")
+            rules = inner.get("matched_rule_ids") or []
+            violated = rules[0] if isinstance(rules, list) and rules else None
+            requires_approval = mapped == "escalated"
+            session_revoked = "KILL" in reason_code.upper()
+        else:
+            mapped = str(raw_decision or "blocked")
+            reason = str(data.get("reason") or "")
+            violated = data.get("violatedRule")
+            requires_approval = bool(data.get("requiresApproval", False))
+            session_revoked = bool(data.get("sessionRevoked", False))
+        mappings = [
+            ComplianceMapping(
+                regulation=m.get("regulation", ""),
+                control_id=m.get("controlId", ""),
+                control_name=m.get("controlName", ""),
+                description=m.get("description", ""),
+            )
+            for m in data.get("complianceMappings", [])
+        ]
+        return PolicyDecision(
+            decision=mapped,
+            reason=reason,
+            violated_rule=violated,
+            requires_approval=requires_approval,
+            session_revoked=session_revoked,
             compliance_mappings=mappings,
             redacted_tokens=redaction.tokens_replaced,
         )

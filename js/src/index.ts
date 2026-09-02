@@ -53,7 +53,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.4.1';
+export const VERSION = '0.5.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -72,6 +72,35 @@ const RETRY_BACKOFF_MS = 500;
 /** Environment variable fallbacks for deployment config (12-factor). */
 const ENV_CONSOLE_URL = 'G8R_CONSOLE_URL';
 const ENV_API_KEY = 'G8R_API_KEY';
+const ENV_PEP_URL = 'G8R_PEP_URL';
+const PEP_DECIDE_PATH = '/decide';
+
+const OUTCOME_TO_DECISION: Record<string, PolicyCheckResult['decision']> = {
+  ALLOW: 'allowed',
+  DENY: 'blocked',
+  REQUIRE_APPROVAL: 'escalated',
+  ERROR: 'blocked',
+};
+
+function rejectLoopback(url: string, field: string): string {
+  const cleaned = url.trim().replace(/\/+$/, '');
+  if (!cleaned) {
+    throw new Error(`${field} is required`);
+  }
+  const host = cleaned.toLowerCase();
+  if (
+    host.includes('://localhost') ||
+    host.includes('://127.0.0.1') ||
+    host.includes('://[::1]') ||
+    host.startsWith('localhost') ||
+    host.startsWith('127.0.0.1')
+  ) {
+    throw new Error(
+      `${field} must not target localhost. An SDK that ships prompts must fail closed rather than silently talk to 127.0.0.1.`
+    );
+  }
+  return cleaned;
+}
 
 // ── Field defaults ────────────────────────────────────────────────────────────
 // Defaulted-not-required fields. Attribution labels that degrade an audit trail
@@ -85,11 +114,15 @@ const DEFAULT_TIMEOUT_SECONDS = 10.0;
 
 export interface ShieldConfig {
   /**
-   * Base URL of the deployed G8R Console. Optional at the type level, but
-   * effectively required: resolved from this field OR the `G8R_CONSOLE_URL`
-   * env var. If neither is present the constructor throws. Never defaults to
-   * localhost — an SDK that ships prompts + API keys must fail closed rather
-   * than silently exfiltrate to 127.0.0.1. A trailing slash is stripped.
+   * Base URL of the PEP gateway. Required: this field OR `G8R_PEP_URL`.
+   * No consoleUrl fallback. Loopback is refused. wrap() hops POST {pepUrl}/decide.
+   */
+  pepUrl?: string;
+  /**
+   * Base URL of the deployed G8R Console (audit /log and the check() gap).
+   * Optional at the type level, but effectively required: resolved from this
+   * field OR the `G8R_CONSOLE_URL` env var. If neither is present the
+   * constructor throws. Never defaults to localhost. A trailing slash is stripped.
    */
   consoleUrl?: string;
   /**
@@ -237,6 +270,7 @@ interface RequestLineage {
 }
 
 export class AgentShield {
+  private readonly pepUrl: string;
   private readonly consoleUrl: string;
   private readonly credential: () => string | Promise<string>;
   private readonly tenantId: TenantId;
@@ -263,6 +297,13 @@ export class AgentShield {
       throw new Error(
         `consoleUrl is required. Pass consoleUrl or set the ${ENV_CONSOLE_URL} env var. ` +
           'An SDK that ships customer prompts and API keys must never default to localhost.'
+      );
+    }
+    const resolvedPep = config.pepUrl || readEnv(ENV_PEP_URL);
+    if (!resolvedPep) {
+      throw new Error(
+        `pepUrl is required. Pass pepUrl or set the ${ENV_PEP_URL} env var. ` +
+          'wrap() hops the PEP; there is no consoleUrl fallback and no localhost default.'
       );
     }
 
@@ -298,6 +339,7 @@ export class AgentShield {
     // Store all fields (with defaults applied) as write-once instance state.
     // The instance holds no mutable state and is safe to share across loops.
     this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
+    this.pepUrl = rejectLoopback(resolvedPep, 'pepUrl');
     this.credential = credential;
     this.tenantId = config.tenantId;
     this.department = config.department ?? DEFAULT_DEPARTMENT;
@@ -320,7 +362,8 @@ export class AgentShield {
    */
   toString(): string {
     return (
-      `AgentShield(consoleUrl=${JSON.stringify(this.consoleUrl)}, ` +
+      `AgentShield(pepUrl=${JSON.stringify(this.pepUrl)}, ` +
+      `consoleUrl=${JSON.stringify(this.consoleUrl)}, ` +
       `tenantId=${JSON.stringify(this.tenantId)}, ` +
       `agentId=${JSON.stringify(this.agentId)}, department=${JSON.stringify(this.department)})`
     );
@@ -414,7 +457,7 @@ export class AgentShield {
     // reporting the resolved lineage. We evaluate directly (rather than via the
     // public check()) so /check and /log share this exact lineage — including a
     // freshly minted session that is not yet in the ambient store.
-    const policyResult = await this.evaluate(prompt, requestId, lineage);
+    const policyResult = await this.evaluatePep(prompt, requestId, lineage);
 
     // Step 2: Log the attempt regardless of decision, BEFORE enforcement, so even
     // blocked attempts land in the audit trail. log() redacts before transmitting.
@@ -633,6 +676,103 @@ export class AgentShield {
       // while an agent's trust-on-first-use registration is pending admin
       // approval (server pending-agent mode 'block'). Reason strings are for
       // humans and are never parsed for this.
+      ...(data.decision === 'blocked' && data.requiresApproval === true
+        ? { isPendingRegistration: true }
+        : {}),
+      ...(data.sessionRevoked !== undefined ? { sessionRevoked: data.sessionRevoked } : {}),
+      complianceMappings: data.complianceMappings ?? [],
+      ...(tokensReplaced.length > 0 ? { redactedTokens: tokensReplaced } : {}),
+    };
+  }
+
+  /**
+   * wrap() one-hop: POST PEP /decide. Never Console /check.
+   */
+  private async evaluatePep(
+    prompt: string,
+    requestId: RequestId,
+    lineage: RequestLineage
+  ): Promise<PolicyCheckResult> {
+    const { redacted, tokensReplaced } = redactSensitiveData(prompt);
+    const scopedLog = log.child({ tenant_id: this.tenantId, request_id: requestId });
+    const credential = await this.resolveCredential();
+    const url = `${this.pepUrl}${PEP_DECIDE_PATH}`;
+    const lineageFields = this.lineageWireFields(lineage);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${credential}`,
+      'User-Agent': SDK_USER_AGENT,
+      'X-GF-Tenant-ID': this.tenantId,
+      'X-GF-Agent-ID': this.agentId,
+    };
+    const parents = lineage.parentAgents;
+    if (parents.length > 0) {
+      headers['x-gf-agent-chain'] = [...parents].reverse().join(',');
+      headers['x-gf-parent-agent-id'] = parents[parents.length - 1];
+    }
+    if (lineage.sessionId) {
+      headers['x-gf-session-id'] = lineage.sessionId;
+    }
+    const body = JSON.stringify({
+      downstream_url: 'sdk://wrap',
+      method: 'POST',
+      action_hint: 'llm_prompt',
+      target_hint: 'llm_prompt',
+      body: { prompt: redacted },
+      correlation_id: requestId,
+      action_type: 'tool_call',
+      ...lineageFields,
+    });
+
+    let res: Response | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers,
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        break;
+      } catch (err) {
+        if (attempt === 0) {
+          await delay(RETRY_BACKOFF_MS);
+          continue;
+        }
+        scopedLog.error('PEP unreachable', { url: this.pepUrl });
+        throw new ShieldConnectionError(this.pepUrl, err);
+      }
+    }
+    if (!res) {
+      throw new ShieldConnectionError(this.pepUrl);
+    }
+    if (!res.ok) {
+      scopedLog.error('PEP decide failed', { status: res.status });
+      const detail = await safeReadText(res);
+      throw new ShieldConsoleError(res.status, detail);
+    }
+    const data = await res.json();
+    const raw = data.decision;
+    if (raw && typeof raw === 'object') {
+      const outcome = String(raw.outcome || '').toUpperCase();
+      const decision = OUTCOME_TO_DECISION[outcome] ?? 'blocked';
+      const reasonCode = String(raw.reason_code || '');
+      const rules: string[] = Array.isArray(raw.matched_rule_ids) ? raw.matched_rule_ids : [];
+      return {
+        decision,
+        reason: String(raw.explanation || reasonCode || ''),
+        violatedRule: rules[0] ?? null,
+        requiresApproval: decision === 'escalated',
+        ...(reasonCode.toUpperCase().includes('KILL') ? { sessionRevoked: true } : {}),
+        complianceMappings: [],
+        ...(tokensReplaced.length > 0 ? { redactedTokens: tokensReplaced } : {}),
+      };
+    }
+    return {
+      decision: data.decision,
+      reason: data.reason,
+      violatedRule: data.violatedRule ?? null,
+      requiresApproval: data.requiresApproval ?? false,
       ...(data.decision === 'blocked' && data.requiresApproval === true
         ? { isPendingRegistration: true }
         : {}),

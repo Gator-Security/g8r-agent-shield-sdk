@@ -18,6 +18,7 @@ import { tenantId } from '../src/ids';
 import { getGovernanceContext, asyncContextIsolated } from '../src/context';
 
 const baseConfig = {
+  pepUrl: 'https://pep.test.example',
   consoleUrl: 'http://localhost:3000',
   apiKey: 'sk-test',
   tenantId: tenantId('acme-inc'),
@@ -39,11 +40,12 @@ const blocked = {
   complianceMappings: [],
 };
 
-/** URL-aware fetch mock: /check → the given decision, everything else → a log entry. */
+/** URL-aware fetch mock: /decide or /check → the given decision, else a log entry. */
 function mockFetch(decision: unknown = allowed): void {
   global.fetch = jest.fn().mockImplementation((url: string) => {
-    const isCheck = String(url).endsWith('/check');
-    const body = isCheck ? decision : { id: 'log-entry', decision: 'allowed', timestamp: 't' };
+    const u = String(url);
+    const isDecision = u.endsWith('/decide') || u.endsWith('/check');
+    const body = isDecision ? decision : { id: 'log-entry', decision: 'allowed', timestamp: 't' };
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -60,7 +62,13 @@ function bodiesFor(suffix: string): any[] {
     .map(([, init]) => JSON.parse(init.body));
 }
 
-const checkBodies = (): any[] => bodiesFor('/check');
+const checkBodies = (): any[] =>
+  (global.fetch as jest.Mock).mock.calls
+    .filter(([url]) => {
+      const u = String(url);
+      return u.endsWith('/decide') || u.endsWith('/check');
+    })
+    .map(([, init]) => JSON.parse(init.body));
 const logBodies = (): any[] => bodiesFor('/log');
 
 /** Force a macrotask boundary so concurrent chains actually interleave. */
@@ -314,7 +322,7 @@ describe('sub-agent lineage', () => {
 
       const checks = checkBodies();
       const byInput = (needle: string): any =>
-        checks.find((c) => String(c.input).includes(needle));
+        checks.find((c) => String(c.input || c.body?.prompt || '').includes(needle));
       const rootA = byInput('root-A');
       const rootB = byInput('root-B');
       const childA = byInput('child-A');

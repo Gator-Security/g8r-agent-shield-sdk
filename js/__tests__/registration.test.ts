@@ -14,6 +14,7 @@ import { AgentShield, ShieldBlockedError } from '../src/index';
 import { tenantId } from '../src/ids';
 
 const mockConfig = {
+  pepUrl: 'https://pep.test.example',
   consoleUrl: 'http://localhost:3000',
   apiKey: 'sk-shield-test-key',
   tenantId: tenantId('acme-inc'),

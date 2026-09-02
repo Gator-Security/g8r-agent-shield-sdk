@@ -25,7 +25,8 @@ from g8r_shield import AgentShield, ShieldBlockedError
 
 shield = AgentShield(
     tenant_id="acme-corp",
-    console_url="https://shield.yourcompany.com",
+    pep_url="https://pep.yourcompany.com",       # or G8R_PEP_URL — required, no localhost
+    console_url="https://shield.yourcompany.com",  # audit /log + check() gap
     api_key="sk-shield-...",
     department="Finance",
     user_id="usr_FIN_042",
@@ -48,7 +49,7 @@ except ShieldBlockedError as err:
         print(f"  {m.regulation} {m.control_id} — {m.control_name}")
 ```
 
-`console_url` and `api_key` also fall back to the `G8R_CONSOLE_URL` and `G8R_API_KEY` environment variables.
+`pep_url` is required (`G8R_PEP_URL`); there is no `console_url` fallback and loopback is refused. `console_url` / `api_key` fall back to `G8R_CONSOLE_URL` / `G8R_API_KEY`. `check()` still POSTs Console `/api/sdk/v1/check` (the documented gap). `wrap()` does not.
 
 ## How It Works
 
@@ -56,21 +57,20 @@ except ShieldBlockedError as err:
 caller invokes shield.wrap(factory, prompt)
        |
        v
-shield.check(prompt) → POST /api/sdk/v1/check
+local redaction (secrets/PII never leave the process raw)
        |
        v
-Policy Engine evaluates against your configured policy set
+POST {pep_url}/decide     ← one policy hop (not Console /check)
        |
        +--> BLOCKED   → ShieldBlockedError raised (factory never called)
        +--> ESCALATED → Warning emitted, factory invoked
        +--> ALLOWED   → Factory invoked, LLM executes
        |
        v
-shield._log() → POST /api/sdk/v1/log
-       |
-       v
-Interaction recorded in Agent Shield Console
+POST {console_url}/api/sdk/v1/log   ← audit adjunct, not a second decision
 ```
+
+Output post-hook stays the PEP `/proxy` HTTP chokepoint's job. wrap() does not rewrite factory output.
 
 The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LLM call **never executes** when the policy blocks it.
 
