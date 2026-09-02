@@ -14,6 +14,7 @@ import { AgentShield, ShieldConnectionError } from '../src/index';
 import { tenantId } from '../src/ids';
 
 const providerConfig = {
+  pepUrl: 'https://pep.test.example',
   consoleUrl: 'http://localhost:3000',
   tenantId: tenantId('acme-inc'),
 };

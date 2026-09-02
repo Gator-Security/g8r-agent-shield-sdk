@@ -7,7 +7,8 @@ import {
 import { tenantId } from '../src/ids';
 
 const mockConfig = {
-  consoleUrl: 'http://localhost:3000',
+  pepUrl: 'https://pep.test.example',
+  consoleUrl: 'https://console.test.example',
   apiKey: 'sk-shield-test-key',
   tenantId: tenantId('acme-inc'),
   department: 'Engineering',
@@ -104,7 +105,7 @@ describe('AgentShield', () => {
       await argShield.check('hi', { log: false });
 
       const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('https://console.test.example/api/sdk/v1/check');
       expect(init.headers.Authorization).toBe('Bearer sk-shield-test-key');
     });
 
@@ -122,17 +123,18 @@ describe('AgentShield', () => {
     it('strips a trailing slash from consoleUrl', async () => {
       const slashShield = new AgentShield({
         ...mockConfig,
-        consoleUrl: 'http://localhost:3000/',
+        consoleUrl: 'https://console.test.example/',
       });
       mockCheckOnly(allowedResponse);
       await slashShield.check('hi', { log: false });
       const [url] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('https://console.test.example/api/sdk/v1/check');
     });
 
     it('applies field defaults (department/userId/aiModel/agentId) when omitted', async () => {
       const minimalShield = new AgentShield({
-        consoleUrl: 'http://localhost:3000',
+        pepUrl: 'https://pep.test.example',
+        consoleUrl: 'https://console.test.example',
         apiKey: 'sk',
         tenantId: tenantId('acme-inc'),
       });
@@ -170,7 +172,7 @@ describe('AgentShield', () => {
       const result = await shield.check('What is the weather?', { log: false });
 
       const [url, init] = (global.fetch as jest.Mock).mock.calls[0];
-      expect(url).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(url).toBe('https://console.test.example/api/sdk/v1/check');
       expect(init.method).toBe('POST');
       expect(init.headers['Content-Type']).toBe('application/json');
       expect(init.headers.Authorization).toBe('Bearer sk-shield-test-key');
@@ -188,10 +190,10 @@ describe('AgentShield', () => {
 
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[0][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/check'
+        'https://console.test.example/api/sdk/v1/check'
       );
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/log'
+        'https://console.test.example/api/sdk/v1/log'
       );
       const checkBody = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
       const logBody = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
@@ -275,8 +277,8 @@ describe('AgentShield', () => {
         thrown = e as ShieldConnectionError;
       }
       expect(thrown).toBeInstanceOf(ShieldConnectionError);
-      expect(thrown!.consoleUrl).toBe('http://localhost:3000');
-      expect(thrown!.message).toContain('http://localhost:3000');
+      expect(thrown!.consoleUrl).toBe('https://console.test.example');
+      expect(thrown!.message).toContain('https://console.test.example');
       expect(global.fetch).toHaveBeenCalledTimes(2); // original + one retry
     });
 
@@ -351,10 +353,10 @@ describe('AgentShield', () => {
       await shield.wrap(() => Promise.resolve('ok'), 'Safe query');
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[0][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/check'
+        'https://pep.test.example/decide'
       );
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/log'
+        'https://console.test.example/api/sdk/v1/log'
       );
     });
 
@@ -380,7 +382,7 @@ describe('AgentShield', () => {
       // /check + /log both fired even though the decision was blocked.
       expect(global.fetch).toHaveBeenCalledTimes(2);
       expect((global.fetch as jest.Mock).mock.calls[1][0]).toBe(
-        'http://localhost:3000/api/sdk/v1/log'
+        'https://console.test.example/api/sdk/v1/log'
       );
     });
 
@@ -534,9 +536,9 @@ describe('AgentShield', () => {
       expect(global.fetch).toHaveBeenCalledTimes(2);
       const checkBody = JSON.parse((global.fetch as jest.Mock).mock.calls[0][1].body);
       const logBody = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
-      expect(checkBody.requestId).toBeDefined();
+      expect(checkBody.correlation_id).toBeDefined();
       expect(logBody.requestId).toBeDefined();
-      expect(checkBody.requestId).toBe(logBody.requestId);
+      expect(checkBody.correlation_id).toBe(logBody.requestId);
     });
 
     it('a /log outage does NOT break the wrapped call (log failure is swallowed)', async () => {

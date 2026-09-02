@@ -38,6 +38,7 @@ Every `check()` / `wrap()` call:
 import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 
 const shield = new AgentShield({
+  pepUrl: 'https://pep.yourcompany.com',
   consoleUrl: 'https://shield.yourcompany.com',
   apiKey: 'sk-shield-...',
   tenantId: tenantId('your-tenant'),
@@ -61,6 +62,7 @@ from g8r_shield import AgentShield
 
 shield = AgentShield(
     tenant_id="your-tenant",
+    pep_url="https://pep.yourcompany.com",
     console_url="https://shield.yourcompany.com",
     api_key="sk-shield-...",
 )
@@ -72,10 +74,11 @@ Full Python API: [`python/README.md`](./python/README.md).
 
 ## Connecting to a self-hosted v2 Console
 
-The v2 Console keeps the same SDK wire contract — the SDKs still call
-`POST /api/sdk/v1/check` and `POST /api/sdk/v1/log` with an
-`Authorization: Bearer <credential>` header. What v2 adds is a second way to
-authenticate that credential, plus first-class agent registration.
+v0.5.0 `wrap()` hops PEP `POST /decide` (`pepUrl` / `G8R_PEP_URL` required; no
+console fallback, no localhost). `check()` still POSTs Console
+`/api/sdk/v1/check` (the documented gap). `/log` remains the audit adjunct.
+What v2 adds is a second way to authenticate that credential, plus first-class
+agent registration.
 
 ### Console-side configuration
 

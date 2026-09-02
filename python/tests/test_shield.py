@@ -44,7 +44,9 @@ from g8r_shield import (
 from .conftest import (
     CHECK_URL,
     CONSOLE_URL,
+    DECIDE_URL,
     LOG_URL,
+    PEP_URL,
     allowed_response,
     blocked_response,
     denied_registration_response,
@@ -52,6 +54,10 @@ from .conftest import (
     kill_switch_response,
     log_response,
     pending_registration_response,
+    pep_allowed_response,
+    pep_blocked_response,
+    pep_escalated_response,
+    pep_kill_switch_response,
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -61,7 +67,7 @@ from .conftest import (
 
 class TestConstruction:
     def test_defaults_applied(self):
-        s = AgentShield(tenant_id="t1", console_url="http://x", api_key="k")
+        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k")
         assert s._department == "General"
         assert s._user_id == "unknown"
         assert s._ai_model == "unknown"
@@ -72,7 +78,7 @@ class TestConstruction:
     def test_console_url_env_fallback(self, monkeypatch):
         monkeypatch.setenv("G8R_CONSOLE_URL", "https://env.example.com/")
         monkeypatch.setenv("G8R_API_KEY", "env-key")
-        s = AgentShield(tenant_id="t1")
+        s = AgentShield(tenant_id="t1", pep_url=PEP_URL)
         # Trailing slash should be stripped.
         assert s._console_url == "https://env.example.com"
         assert s._api_key == "env-key"
@@ -82,6 +88,7 @@ class TestConstruction:
         monkeypatch.setenv("G8R_API_KEY", "env-key")
         s = AgentShield(
             tenant_id="t1",
+            pep_url=PEP_URL,
             console_url="https://explicit.example.com",
             api_key="explicit-key",
         )
@@ -91,22 +98,41 @@ class TestConstruction:
     def test_raises_when_no_api_key(self, monkeypatch):
         monkeypatch.delenv("G8R_API_KEY", raising=False)
         with pytest.raises(ValueError, match="G8R API key is required"):
-            AgentShield(tenant_id="t1", console_url="http://x")
+            AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x")
 
     def test_raises_when_no_tenant_id(self):
         """Empty tenant_id must fail-fast at construction."""
         with pytest.raises(ValueError, match="tenant_id is required"):
-            AgentShield(tenant_id="", console_url="http://x", api_key="k")
+            AgentShield(tenant_id="", pep_url=PEP_URL, console_url="http://x", api_key="k")
+
+    def test_raises_when_no_pep_url(self, monkeypatch):
+        monkeypatch.delenv("G8R_PEP_URL", raising=False)
+        with pytest.raises(ValueError, match="pep_url is required"):
+            AgentShield(tenant_id="t1", console_url="https://c.example.com", api_key="k")
+
+    def test_pep_url_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("G8R_PEP_URL", "https://pep.env.example/")
+        s = AgentShield(tenant_id="t1", console_url="https://c.example.com", api_key="k")
+        assert s._pep_url == "https://pep.env.example"
+
+    def test_pep_url_rejects_localhost(self):
+        with pytest.raises(ValueError, match="localhost"):
+            AgentShield(
+                tenant_id="t1",
+                pep_url="http://localhost:8083",
+                console_url="https://c.example.com",
+                api_key="k",
+            )
 
     def test_raises_when_no_console_url(self, monkeypatch):
         # Fail-closed: no implicit localhost default. A misconfigured agent
         # must not silently POST prompts + API keys to 127.0.0.1.
         monkeypatch.delenv("G8R_CONSOLE_URL", raising=False)
         with pytest.raises(ValueError, match="console_url is required"):
-            AgentShield(tenant_id="t1", api_key="k")
+            AgentShield(tenant_id="t1", pep_url=PEP_URL, api_key="k")
 
     def test_timeout_accepts_float(self):
-        s = AgentShield(tenant_id="t1", console_url="http://x", api_key="k", timeout=2.5)
+        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k", timeout=2.5)
         assert s._timeout == 2.5
 
     def test_slots_blocks_ad_hoc_attributes(self, shield):
@@ -115,6 +141,7 @@ class TestConstruction:
 
     def test_slots_declared_with_expected_fields(self):
         assert set(AgentShield.__slots__) == {
+            "_pep_url",
             "_console_url",
             "_api_key",
             "_credential_provider",
@@ -232,16 +259,17 @@ class TestCheck:
 class TestWrap:
     @responses.activate
     def test_allowed_calls_factory_and_returns_result(self, shield):
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         result = shield.wrap(lambda: "factory-result", "safe prompt")
 
         assert result == "factory-result"
+        assert all("/api/sdk/v1/check" not in (c.request.url or "") for c in responses.calls)
 
     @responses.activate
     def test_blocked_raises_shield_blocked_error(self, shield):
-        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_blocked_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with pytest.raises(ShieldBlockedError) as exc_info:
@@ -252,7 +280,7 @@ class TestWrap:
 
     @responses.activate
     def test_blocked_factory_never_called(self, shield, mocker):
-        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_blocked_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock(return_value="never")
@@ -263,7 +291,7 @@ class TestWrap:
 
     @responses.activate
     def test_kill_switch_propagates_session_revoked_on_error(self, shield):
-        responses.add(responses.POST, CHECK_URL, json=kill_switch_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_kill_switch_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with capture_logs() as logs, pytest.raises(ShieldBlockedError) as exc_info:
@@ -278,7 +306,7 @@ class TestWrap:
     @responses.activate
     def test_escalated_default_warns_and_proceeds(self, shield, mocker):
         """Default config: escalated → emit structured warning + invoke factory."""
-        responses.add(responses.POST, CHECK_URL, json=escalated_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_escalated_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock(return_value="approved-result")
@@ -296,7 +324,7 @@ class TestWrap:
     @responses.activate
     def test_escalated_with_block_on_escalated_raises(self, strict_shield, mocker):
         """Strict config: escalated → raise instead of proceeding."""
-        responses.add(responses.POST, CHECK_URL, json=escalated_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_escalated_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock()
@@ -309,21 +337,21 @@ class TestWrap:
     @responses.activate
     def test_log_called_before_enforcement(self, shield, mocker):
         """Audit log fires BEFORE the block — blocked decisions are still recorded."""
-        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_blocked_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with pytest.raises(ShieldBlockedError):
             shield.wrap(lambda: None, "bad prompt")
 
-        # Two calls: /check then /log. Order matters — log must precede the raise.
+        # Two calls: /decide then /log. Order matters — log must precede the raise.
         assert len(responses.calls) == 2
-        assert responses.calls[0].request.url == CHECK_URL
+        assert responses.calls[0].request.url == DECIDE_URL
         assert responses.calls[1].request.url == LOG_URL
 
     @responses.activate
     def test_log_exception_swallowed(self, shield, mocker):
         """_log raising arbitrary Exception must not interrupt the decision path."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_allowed_response(), status=200)
         # Make the log endpoint return invalid JSON, triggering ValueError on parse.
         responses.add(responses.POST, LOG_URL, body="not-json-at-all", status=200)
 
@@ -342,7 +370,7 @@ class TestWrap:
     @responses.activate
     def test_log_http_error_swallowed(self, shield):
         """_log getting a 500 must not interrupt the decision path either."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pep_allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json={"error": "boom"}, status=500)
 
         with capture_logs() as logs:
@@ -557,7 +585,7 @@ class TestPayloadShape:
         """When employee_name is None, log payload uses user_id."""
 
         s = AgentShield(
-            tenant_id="tenant-test",
+            tenant_id="tenant-test", pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_999",
@@ -615,7 +643,7 @@ class TestPayloadShape:
     @responses.activate
     def test_check_payload_omits_employee_name_when_none(self):
         s = AgentShield(
-            tenant_id="tenant-test",
+            tenant_id="tenant-test", pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_x",
@@ -671,7 +699,7 @@ class TestPayloadShape:
         and the audit log. Before this fix, _evaluate and _log each minted
         their own uuid4 so the two server-side log lines could not be joined.
         """
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         shield.wrap(lambda: "ok", "prompt")
@@ -680,9 +708,7 @@ class TestPayloadShape:
         check_body = json.loads(responses.calls[0].request.body)
         log_body = json.loads(responses.calls[1].request.body)
 
-        assert "requestId" in check_body
-        assert "requestId" in log_body
-        assert check_body["requestId"] == log_body["requestId"]  # SAME id
+        assert check_body.get("correlation_id") == log_body["requestId"]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -839,7 +865,7 @@ class TestWrapExhaustive:
             "sessionRevoked": False,
             "complianceMappings": [],
         }
-        responses.add(responses.POST, CHECK_URL, json=weird, status=200)
+        responses.add(responses.POST, DECIDE_URL, json=weird, status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock(return_value="should-not-run")
@@ -860,7 +886,7 @@ class TestWrapExhaustive:
             "sessionRevoked": False,
             "complianceMappings": [],
         }
-        responses.add(responses.POST, CHECK_URL, json=weird, status=200)
+        responses.add(responses.POST, DECIDE_URL, json=weird, status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with pytest.raises(ShieldBlockedError):
@@ -881,20 +907,20 @@ class TestWrapRoutesThroughCheck:
     def test_wrap_emits_exactly_one_log_line(self, shield):
         """wrap() reuses check(log=False) then logs once explicitly — so a
         wrap() invocation produces exactly ONE /log entry, not two."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         shield.wrap(lambda: "ok", "prompt")
 
         log_calls = [c for c in responses.calls if c.request.url == LOG_URL]
-        check_calls = [c for c in responses.calls if c.request.url == CHECK_URL]
+        check_calls = [c for c in responses.calls if c.request.url == DECIDE_URL]
         assert len(check_calls) == 1
         assert len(log_calls) == 1
 
     @responses.activate
     def test_wrap_check_and_log_omit_employee_name_on_check_only(self, shield):
         """Through wrap(): /check omits employeeName, /log carries it."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         shield.wrap(lambda: "ok", "prompt")
@@ -920,7 +946,7 @@ class TestCredentialProvider:
     @staticmethod
     def _provider_shield(provider) -> AgentShield:
         return AgentShield(
-            tenant_id="tenant-test",
+            tenant_id="tenant-test", pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             credential_provider=provider,
         )
@@ -936,7 +962,7 @@ class TestCredentialProvider:
         """Two explicit credential sources is a config bug — fail fast."""
         with pytest.raises(ValueError, match="mutually exclusive"):
             AgentShield(
-                tenant_id="t1",
+                tenant_id="t1", pep_url=PEP_URL,
                 console_url=CONSOLE_URL,
                 api_key="sk-static",
                 credential_provider=lambda: "jwt-abc",
@@ -1022,7 +1048,7 @@ class TestCredentialProvider:
         outcomes = iter(["jwt-ok"])  # first call succeeds, second exhausts → StopIteration
 
         s = self._provider_shield(lambda: next(outcomes))
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
 
         with capture_logs() as logs:
             result = s.wrap(lambda: "ok", "safe prompt")
@@ -1106,7 +1132,7 @@ class TestIsPendingRegistration:
         """Block mode: wrap() raises ShieldBlockedError with requires_approval
         and the mirrored property, so handlers can branch 'awaiting admin
         approval' vs. 'policy blocked' without a second round-trip."""
-        responses.add(responses.POST, CHECK_URL, json=pending_registration_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=pending_registration_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock()
@@ -1121,7 +1147,7 @@ class TestIsPendingRegistration:
     def test_wrap_ordinary_block_is_not_pending(self, shield):
         """A plain policy block through wrap() must not masquerade as a
         pending registration."""
-        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=blocked_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with pytest.raises(ShieldBlockedError) as exc_info:
@@ -1148,7 +1174,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.4.1"
+    CANONICAL_VERSION = "0.5.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1157,6 +1183,7 @@ class TestCanonicalContract:
         params = {name for name in sig.parameters if name != "self"}
         assert params == {
             "tenant_id",
+            "pep_url",
             "console_url",
             "api_key",
             "department",
@@ -1258,7 +1285,7 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.4.1 (lockstep) so 'are these in
+        """Both SDKs land on the SAME 0.5.0 (lockstep) so 'are these in
         parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 
@@ -1271,7 +1298,7 @@ class TestCanonicalContract:
     def test_repr_never_exposes_api_key(self):
         """Contract: api_key must never appear in repr/str."""
         s = AgentShield(
-            tenant_id="t1",
+            tenant_id="t1", pep_url=PEP_URL,
             console_url="https://c.example.com",
             api_key="sk-super-secret-abc123",
         )
@@ -1293,7 +1320,7 @@ class TestCanonicalContract:
 def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
     """Build a shield against the mock console with a given agent_id."""
     return AgentShield(
-        tenant_id="tenant-test",
+        tenant_id="tenant-test", pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         agent_id=agent_id,
@@ -1302,8 +1329,13 @@ def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
 
 
 def _check_bodies() -> list[dict]:
-    """Parsed request bodies of every /check call, in order."""
+    """Parsed request bodies of Console /check calls, in order."""
     return [json.loads(c.request.body) for c in responses.calls if c.request.url == CHECK_URL]
+
+
+def _decide_bodies() -> list[dict]:
+    """Parsed request bodies of wrap() PEP /decide hops, in order."""
+    return [json.loads(c.request.body) for c in responses.calls if c.request.url == DECIDE_URL]
 
 
 class TestLineageTopLevel:
@@ -1313,7 +1345,7 @@ class TestLineageTopLevel:
         /log) and sends NO ancestors — the canonical top-of-tree wire shape."""
         import uuid as _uuid
 
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         shield.wrap(lambda: "ok", "prompt")
@@ -1376,7 +1408,7 @@ class TestLineageNested:
     def test_nested_wrap_inherits_session_and_reports_parent(self):
         """A wrap() nested inside a parent wrap()'s factory sends the SAME
         session and parentAgents == [parent_agent_id]."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         parent = _lineage_shield(agent_id="parent-agent")
@@ -1389,7 +1421,7 @@ class TestLineageNested:
         assert result == "child-ok"
 
         # /check calls in order: parent, then child (nested inside the factory).
-        parent_check, child_check = _check_bodies()
+        parent_check, child_check = _decide_bodies()
         child_log = json.loads(responses.calls[3].request.body)
 
         assert child_check["sessionId"] == parent_check["sessionId"]  # same run
@@ -1401,7 +1433,7 @@ class TestLineageNested:
     def test_two_levels_deep_chain_is_root_first(self):
         """root -> mid -> leaf: the leaf sends parentAgents == [root, mid]
         (root-first, immediate-parent last); all three share one session."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         root = _lineage_shield(agent_id="root")
@@ -1416,7 +1448,7 @@ class TestLineageNested:
             "root prompt",
         )
 
-        root_check, mid_check, leaf_check = _check_bodies()
+        root_check, mid_check, leaf_check = _decide_bodies()
         assert mid_check["parentAgents"] == ["root"]
         assert leaf_check["parentAgents"] == ["root", "mid"]
         assert mid_check["sessionId"] == root_check["sessionId"]
@@ -1427,7 +1459,8 @@ class TestLineageNested:
         """The escalated-but-proceed path runs factory() inside the extended
         scope too, so a call nested under an escalated action still inherits the
         chain."""
-        responses.add(responses.POST, CHECK_URL, json=escalated_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=escalated_response(), status=200)
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         parent = _lineage_shield(agent_id="esc-parent")
@@ -1471,13 +1504,13 @@ class TestLineageRunScope:
     def test_wrap_inside_run_adopts_run_session(self, shield):
         """A wrap() inside a run() adopts the run's session rather than minting
         a fresh one — multi-turn calls stay under one run id."""
-        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with shield.run(session_id="grp-1"):
             shield.wrap(lambda: "ok", "prompt")
 
-        assert _check_bodies()[0]["sessionId"] == "grp-1"
+        assert _decide_bodies()[0]["sessionId"] == "grp-1"
 
     @responses.activate
     def test_nested_run_does_not_split_session(self, shield):
@@ -1521,6 +1554,7 @@ class TestLineageContextRestoration:
     def test_context_restored_after_allowed_wrap(self, shield):
         """After a top-level wrap(), the ambient context is back to empty — a
         subsequent lone check() inherits neither session nor chain."""
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
@@ -1535,7 +1569,8 @@ class TestLineageContextRestoration:
     def test_context_restored_after_denied_wrap(self, shield):
         """Even when wrap() denies (raises), the eval-time context pin is
         unwound — a follow-up check() sends no lineage."""
-        responses.add(responses.POST, CHECK_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, DECIDE_URL, json=blocked_response(), status=200)
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         with pytest.raises(ShieldBlockedError):
@@ -1550,6 +1585,7 @@ class TestLineageContextRestoration:
     @responses.activate
     def test_context_restored_when_factory_raises(self, shield):
         """If factory() raises, the nested scope is still unwound (finally)."""
+        responses.add(responses.POST, DECIDE_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
