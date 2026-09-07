@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "g8r-shield"
-version = "0.5.0"
+version = "0.5.1"
 description = "G8R Agent Shield SDK — wrap LLM calls with enterprise policy enforcement, audit logging, and tenant isolation."
 readme = "README.md"
 license = "Apache-2.0"
@@ -128,3 +128,10 @@ ignore_missing_imports = true   # requests has no stubs by default
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false   # test functions don't always need annotations
+
+# google-adk ships no stubs; BasePlugin is Any. Subclassing it is [misc] under
+# mypy --strict. The plugin extra is optional; ignore_missing_imports is not
+# enough once the import succeeds inside the extra.
+[[tool.mypy.overrides]]
+module = "google.adk.*"
+disable_error_code = ["misc"]
