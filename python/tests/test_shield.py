@@ -1174,7 +1174,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.5.1"
+    CANONICAL_VERSION = "0.5.2"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1285,7 +1285,7 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.5.1 (lockstep) so 'are these in
+        """Both SDKs land on the SAME 0.5.2 (lockstep) so 'are these in
         parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 

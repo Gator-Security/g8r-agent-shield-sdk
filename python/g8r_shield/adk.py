@@ -68,7 +68,7 @@ __all__ = ["ShieldPlugin"]
 DENIAL_MARKER = "g8r_shield.blocked"
 
 
-class ShieldPlugin(BasePlugin):
+class ShieldPlugin(BasePlugin):  # type: ignore[misc]
     """Governs an entire ADK agent tree through one Agent Shield policy engine."""
 
     def __init__(
