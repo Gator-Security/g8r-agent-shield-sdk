@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "g8r-shield"
-version = "0.5.1"
+version = "0.5.2"
 description = "G8R Agent Shield SDK — wrap LLM calls with enterprise policy enforcement, audit logging, and tenant isolation."
 readme = "README.md"
 license = "Apache-2.0"
@@ -135,3 +135,7 @@ disallow_untyped_defs = false   # test functions don't always need annotations
 [[tool.mypy.overrides]]
 module = "google.adk.*"
 disable_error_code = ["misc"]
+
+[[tool.mypy.overrides]]
+module = "g8r_shield.adk"
+warn_unused_ignores = false
