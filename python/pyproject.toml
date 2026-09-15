@@ -52,6 +52,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+receipts = [
+    "cryptography>=46.0.4",
+]
 bedrock = [
     "boto3>=1.34",
 ]
@@ -62,6 +65,7 @@ adk = [
     "google-adk>=2.6",
 ]
 dev = [
+    "cryptography>=46.0.4",
     "pytest>=8",
     "pytest-mock>=3.12",
     "responses>=0.25",
