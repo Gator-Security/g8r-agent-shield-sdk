@@ -16,6 +16,13 @@ import structlog
 
 from ._version import __version__ as _SDK_VERSION
 from .redaction import redact_sensitive_data
+from .receipts import (
+    ReceiptVerificationConfig,
+    ReceiptVerificationError,
+    ReceiptVerifier,
+    assert_receipt_transport,
+    build_receipt_request,
+)
 
 try:
     import requests
@@ -204,6 +211,8 @@ class PolicyDecision:
     # layer before it reached the gateway. Empty when the prompt was clean.
     # Parity with the TypeScript SDK's `PolicyCheckResult.redactedTokens`.
     redacted_tokens: list[str] = field(default_factory=list)
+    # Verified compact JWS from check(). The current /log endpoint does not store it.
+    decision_receipt: str | None = None
 
     @property
     def is_pending_registration(self) -> bool:
@@ -398,6 +407,7 @@ class AgentShield:
         "_session_id",
         "_timeout",
         "_block_on_escalated",
+        "_receipt_verifier",
     )
 
     def __init__(
@@ -416,6 +426,7 @@ class AgentShield:
         timeout: float = 10.0,
         block_on_escalated: bool = False,
         credential_provider: Callable[[], str] | None = None,
+        receipt_verification: ReceiptVerificationConfig | None = None,
     ) -> None:
         if not _HAS_REQUESTS:
             raise ImportError(
@@ -473,7 +484,14 @@ class AgentShield:
         self._agent_id = agent_id
         self._session_id = session_id
         self._timeout = timeout
-        self._block_on_escalated = block_on_escalated
+        self._receipt_verifier = (
+            ReceiptVerifier(receipt_verification) if receipt_verification is not None else None
+        )
+        if self._receipt_verifier is not None:
+            assert_receipt_transport(self._pep_url)
+            assert_receipt_transport(self._console_url)
+        # Requiring approval is not permission to run the callback.
+        self._block_on_escalated = self._receipt_verifier is not None or block_on_escalated
 
     def __repr__(self) -> str:
         # Deliberately omits api_key — never expose it in logs or repr output.
@@ -773,6 +791,43 @@ class AgentShield:
                 "underlying error."
             ) from exc
 
+    def _prepare_receipt_request(
+        self, endpoint: str, payload: dict[str, Any],
+        headers: dict[str, str | bytes], request_id: str,
+    ) -> dict[str, Any] | None:
+        if self._receipt_verifier is None:
+            return None
+        wire_headers = {
+            name: value.decode("ascii") if isinstance(value, bytes) else value
+            for name, value in headers.items()
+        }
+        request = build_receipt_request(
+            endpoint=endpoint, tenant_id=self._tenant_id, agent_id=self._agent_id,
+            request_id=request_id, headers=wire_headers, body=payload,
+        )
+        headers["X-G8R-Receipt-Nonce"] = request["nonce"]
+        headers["X-G8R-Receipt-Version"] = "1"
+        return request
+
+    def _verified_policy_decision(
+        self, data: Any, request: dict[str, Any], tokens: list[str],
+    ) -> PolicyDecision:
+        if self._receipt_verifier is None:
+            raise ReceiptVerificationError("Receipt verifier is required")
+        receipt = self._receipt_verifier.verify_response(data, request)
+        decision = receipt.decision
+        return PolicyDecision(
+            decision=decision["decision"], reason=decision["reason"],
+            violated_rule=decision["violatedRule"],
+            requires_approval=decision["requiresApproval"],
+            session_revoked=decision["sessionRevoked"],
+            compliance_mappings=[ComplianceMapping(
+                regulation=m["regulation"], control_id=m["controlId"],
+                control_name=m["controlName"], description=m["description"],
+            ) for m in decision["complianceMappings"]],
+            redacted_tokens=tokens, decision_receipt=receipt.token,
+        )
+
     def _evaluate(self, prompt: str, request_id: str | None = None) -> PolicyDecision:
         # `request_id` is generated per-call by default. `wrap()` passes its
         # own value so /check and /log share a single correlation id.
@@ -823,6 +878,9 @@ class AgentShield:
         # Single retry on transient network failures. Hard failures (4xx HTTP
         # responses, including 401/403) are surfaced immediately — retrying
         # those is just doubling the user-visible latency.
+        receipt_request = self._prepare_receipt_request(
+            "/api/sdk/v1/check", payload, headers, request_id,
+        )
         response = None
         last_exc: Exception | None = None
         for attempt in range(2):
@@ -862,6 +920,8 @@ class AgentShield:
             ) from last_exc
 
         data = response.json()
+        if receipt_request is not None:
+            return self._verified_policy_decision(data, receipt_request, redaction.tokens_replaced)
         mappings = [
             ComplianceMapping(
                 regulation=m.get("regulation", ""),
@@ -916,6 +976,9 @@ class AgentShield:
             **lineage,
         }
 
+        receipt_request = self._prepare_receipt_request(
+            "/decide", payload, headers, request_id,
+        )
         response = None
         last_exc: Exception | None = None
         for attempt in range(2):
@@ -943,6 +1006,8 @@ class AgentShield:
             ) from last_exc
 
         data = response.json() if response.content else {}
+        if receipt_request is not None:
+            return self._verified_policy_decision(data, receipt_request, redaction.tokens_replaced)
         raw_decision = data.get("decision")
         # Live PEP /decide: {decision: {outcome, reason_code, ...}}. A string
         # `decision` is the Console /check shape — wrap() must not depend on it.
