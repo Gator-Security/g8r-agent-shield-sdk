@@ -893,7 +893,7 @@ class AgentShield:
             "X-GF-Tenant-ID": self._tenant_id,
             "X-GF-Agent-ID": self._agent_id,
             "x-gf-department": self._department,
-        };
+        }
         parents = lineage.get("parentAgents") or []
         if parents:
             # SDK chain is root-first, immediate parent last. PEP x-gf-agent-chain
