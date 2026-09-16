@@ -65,7 +65,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.5.2';
+export const VERSION = '0.6.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every

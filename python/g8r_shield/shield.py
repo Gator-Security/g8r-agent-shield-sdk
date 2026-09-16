@@ -15,7 +15,6 @@ from typing import Any, TypeVar
 import structlog
 
 from ._version import __version__ as _SDK_VERSION
-from .redaction import redact_sensitive_data
 from .receipts import (
     ReceiptVerificationConfig,
     ReceiptVerificationError,
@@ -23,6 +22,7 @@ from .receipts import (
     assert_receipt_transport,
     build_receipt_request,
 )
+from .redaction import redact_sensitive_data
 
 try:
     import requests
