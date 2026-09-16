@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from .redaction import redact_sensitive_data
@@ -149,7 +150,10 @@ class ShieldPlugin(BasePlugin):  # type: ignore[misc]
                 stack.enter_context(self._shield.run(session_id=session_id))
                 for parent in chain or []:
                     stack.enter_context(self._shield.child(parent))
-                return self._shield.check(description, log=True)
+                request_id = str(uuid.uuid4())
+                decision = self._shield._evaluate_pep(description, request_id)
+                self._shield._log(description, decision, request_id=request_id)
+                return decision
 
         return await asyncio.to_thread(_blocking)
 
