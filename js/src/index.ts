@@ -704,6 +704,7 @@ export class AgentShield {
       'User-Agent': SDK_USER_AGENT,
       'X-GF-Tenant-ID': this.tenantId,
       'X-GF-Agent-ID': this.agentId,
+      'x-gf-department': this.department,
     };
     const parents = lineage.parentAgents;
     if (parents.length > 0) {

@@ -222,6 +222,14 @@ describe('canonical parity', () => {
     const hopHeaders = (global.fetch as jest.Mock).mock.calls[0][1].headers;
     const logBody = JSON.parse((global.fetch as jest.Mock).mock.calls[1][1].body);
     expect(hopHeaders['X-GF-Agent-ID']).toBe('my-agent');
+    expect(hopHeaders['x-gf-department']).toBe('General');
     expect(logBody.agentId).toBe('my-agent');
+    expect(logBody.department).toBe('General');
+    // PEP Actor has no user header. x-gf-model-id is an upstream RESPONSE
+    // header. User and model stay on Console /log only.
+    expect(hopHeaders['x-gf-user-id']).toBeUndefined();
+    expect(hopHeaders['x-gf-model-id']).toBeUndefined();
+    expect(logBody.userId).toBe('unknown');
+    expect(logBody.aiModel).toBe('unknown');
   });
 });

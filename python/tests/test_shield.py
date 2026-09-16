@@ -250,6 +250,19 @@ class TestCheck:
 
         assert decision.decision == "blocked"  # no raise
 
+    @responses.activate
+    def test_check_does_not_send_x_gf_department_header(self, shield):
+        """Console /check uses JSON department. x-gf-department is PEP-only."""
+        responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
+
+        shield.check("test", log=False)
+
+        req = responses.calls[0].request
+        assert req.url == CHECK_URL
+        assert "x-gf-department" not in req.headers
+        body = json.loads(req.body)
+        assert body["department"] == "Engineering"
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # wrap()
@@ -266,6 +279,47 @@ class TestWrap:
 
         assert result == "factory-result"
         assert all("/api/sdk/v1/check" not in (c.request.url or "") for c in responses.calls)
+
+    @responses.activate
+    def test_wrap_decide_sends_x_gf_department_from_constructor(self, shield):
+        """PEP /decide reads x-gf-department for cost metering.
+
+        PEP Actor has no user header. x-gf-model-id is an upstream RESPONSE
+        header. User and model stay on Console /log only.
+        """
+        responses.add(responses.POST, DECIDE_URL, json=pep_allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        shield.wrap(lambda: "ok", "safe prompt")
+
+        decide = responses.calls[0].request
+        log = responses.calls[1].request
+        assert decide.url == DECIDE_URL
+        assert log.url == LOG_URL
+        assert decide.headers["x-gf-department"] == "Engineering"
+        assert decide.headers["X-GF-Tenant-ID"] == "tenant-test"
+        assert decide.headers["X-GF-Agent-ID"] == "test-agent"
+        assert decide.headers.get("x-gf-session-id")
+        assert "x-gf-user-id" not in decide.headers
+        assert "x-gf-model-id" not in decide.headers
+        log_body = json.loads(log.body)
+        assert log_body["userId"] == "usr_TEST_001"
+        assert log_body["aiModel"] == "test-model"
+
+    @responses.activate
+    def test_wrap_decide_defaults_x_gf_department_to_general(self):
+        s = AgentShield(
+            tenant_id="t1",
+            pep_url=PEP_URL,
+            console_url=CONSOLE_URL,
+            api_key="k",
+        )
+        responses.add(responses.POST, DECIDE_URL, json=pep_allowed_response(), status=200)
+        responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
+
+        s.wrap(lambda: "ok", "safe prompt")
+
+        assert responses.calls[0].request.headers["x-gf-department"] == "General"
 
     @responses.activate
     def test_blocked_raises_shield_blocked_error(self, shield):
