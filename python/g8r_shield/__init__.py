@@ -34,6 +34,14 @@ import structlog
 # namespace at module-load time. Re-exported below for the
 # `g8r_shield.__version__` public API.
 from ._version import __version__
+from .receipts import (
+    ReceiptVerificationConfig,
+    ReceiptVerificationError,
+    ReceiptVerifier,
+    VerifiedReceipt,
+    build_receipt_request,
+    request_hash,
+)
 
 # Configure structlog once at module import so consumers get structured JSON
 # log output with timestamp + level out of the box. Audit logging requires
@@ -73,6 +81,12 @@ def get_logger(**bindings: object) -> structlog.stdlib.BoundLogger:
 
 
 __all__ = [
+    "ReceiptVerificationConfig",
+    "ReceiptVerificationError",
+    "ReceiptVerifier",
+    "VerifiedReceipt",
+    "build_receipt_request",
+    "request_hash",
     "AgentShield",
     "ComplianceMapping",
     "PolicyDecision",

@@ -154,6 +154,7 @@ class TestConstruction:
             "_session_id",
             "_timeout",
             "_block_on_escalated",
+            "_receipt_verifier",
         }
 
 
@@ -1228,7 +1229,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.5.2"
+    CANONICAL_VERSION = "0.6.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1249,6 +1250,7 @@ class TestCanonicalContract:
             "timeout",
             "block_on_escalated",
             "credential_provider",
+            "receipt_verification",
         }
 
     def test_constructor_params_are_keyword_only(self):
@@ -1282,6 +1284,7 @@ class TestCanonicalContract:
         assert defaults["timeout"] == 10.0
         assert defaults["block_on_escalated"] is False
         assert defaults["credential_provider"] is None
+        assert defaults["receipt_verification"] is None
 
     def test_tenant_id_is_the_sole_hard_required_field(self):
         """tenant_id has no default; everything else does (env-fallback fields
@@ -1339,7 +1342,7 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.5.2 (lockstep) so 'are these in
+        """Both SDKs land on the SAME 0.6.0 (lockstep) so 'are these in
         parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 

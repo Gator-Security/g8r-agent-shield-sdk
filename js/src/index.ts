@@ -38,6 +38,18 @@ import { newRequestId, newSessionId, type RequestId, type TenantId } from './ids
 import { getGovernanceContext, runWithGovernanceContext } from './context';
 import { log } from './logger';
 import { redactSensitiveData } from './redaction';
+import {
+  ReceiptVerifier, ReceiptVerificationError, buildReceiptRequest, assertReceiptTransport,
+  type ReceiptVerificationConfig, type ReceiptRequest,
+} from './receipts';
+export {
+  ReceiptVerifier, ReceiptVerificationError, buildReceiptRequest, receiptRequestHash,
+  canonicalJson, RECEIPT_ALGORITHM, RECEIPT_TYPE,
+} from './receipts';
+export type {
+  ReceiptVerificationConfig, ReceiptRequest, ReceiptRequestInput,
+  ReceiptDecision, ReceiptClaims, VerifiedReceipt,
+} from './receipts';
 
 // ── Public API re-exports ────────────────────────────────────────────────────
 // Consumers need `tenantId()` to construct the branded TenantId required by
@@ -53,7 +65,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.5.2';
+export const VERSION = '0.6.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -113,6 +125,11 @@ const DEFAULT_AGENT_ID = 'sdk-client';
 const DEFAULT_TIMEOUT_SECONDS = 10.0;
 
 export interface ShieldConfig {
+  /** When set, both check() and wrap() require a valid signed receipt.
+   * There is no unsigned fallback. Approval-required decisions never execute.
+   * Leaving this unset keeps the existing unsigned behavior.
+   */
+  receiptVerification?: ReceiptVerificationConfig;
   /**
    * Base URL of the PEP gateway. Required: this field OR `G8R_PEP_URL`.
    * No consoleUrl fallback. Loopback is refused. wrap() hops POST {pepUrl}/decide.
@@ -188,6 +205,8 @@ export interface ShieldConfig {
 }
 
 export interface PolicyCheckResult {
+  /** Verified compact JWS. The current /log endpoint does not store it. */
+  decisionReceipt?: string;
   decision: 'allowed' | 'blocked' | 'escalated';
   reason: string;
   violatedRule: string | null;
@@ -283,6 +302,7 @@ export class AgentShield {
   private readonly employeeName?: string;
   private readonly timeoutMs: number;
   private readonly blockOnEscalated: boolean;
+  private readonly receiptVerifier?: ReceiptVerifier;
 
   constructor(config: ShieldConfig) {
     if (!config.tenantId) {
@@ -353,7 +373,14 @@ export class AgentShield {
     this.sessionId = config.sessionId;
     this.employeeName = config.employeeName;
     this.timeoutMs = (config.timeout ?? DEFAULT_TIMEOUT_SECONDS) * 1000;
-    this.blockOnEscalated = config.blockOnEscalated ?? false;
+    this.receiptVerifier = config.receiptVerification === undefined
+      ? undefined : new ReceiptVerifier(config.receiptVerification);
+    if (this.receiptVerifier) {
+      assertReceiptTransport(this.pepUrl);
+      assertReceiptTransport(this.consoleUrl);
+    }
+    // Requiring approval is not permission to run the callback.
+    this.blockOnEscalated = this.receiptVerifier !== undefined || (config.blockOnEscalated ?? false);
   }
 
   /**
@@ -582,6 +609,40 @@ export class AgentShield {
     };
   }
 
+  /** Create a new challenge for this check. Retries keep the same one. */
+  private prepareReceiptRequest(
+    endpoint: ReceiptRequest['endpoint'],
+    headers: Record<string, string>,
+    body: Record<string, unknown>,
+    requestId: RequestId
+  ): ReceiptRequest | undefined {
+    if (!this.receiptVerifier) return undefined;
+    const request = buildReceiptRequest({
+      endpoint, tenantId: this.tenantId, agentId: this.agentId,
+      requestId, headers, body,
+    });
+    headers['X-G8R-Receipt-Nonce'] = request.nonce;
+    headers['X-G8R-Receipt-Version'] = '1';
+    return request;
+  }
+
+  /** Use the signed decision, not any unsigned fields beside it. */
+  private verifyReceipt(
+    data: unknown, request: ReceiptRequest, tokensReplaced: string[]
+  ): PolicyCheckResult {
+    if (!this.receiptVerifier) throw new ReceiptVerificationError('Receipt verifier is required');
+    const verified = this.receiptVerifier.verifyResponse(data, request);
+    const decision = verified.decision;
+    return {
+      ...decision,
+      complianceMappings: decision.complianceMappings.map(mapping => ({ ...mapping })),
+      decisionReceipt: verified.token,
+      ...(decision.decision === 'blocked' && decision.requiresApproval
+        ? { isPendingRegistration: true } : {}),
+      ...(tokensReplaced.length > 0 ? { redactedTokens: tokensReplaced } : {}),
+    };
+  }
+
   /**
    * POST the redacted prompt + governance fields to /api/sdk/v1/check and parse
    * the decision. Retries exactly once on a transient connection/timeout error
@@ -621,6 +682,15 @@ export class AgentShield {
       ...this.lineageWireFields(lineage),
     });
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${credential}`,
+      'User-Agent': SDK_USER_AGENT,
+    };
+    const receiptRequest = this.prepareReceiptRequest(
+      '/api/sdk/v1/check', headers, JSON.parse(body), requestId
+    );
+
     // Single retry on transient network failures (connection refused / timeout).
     // Hard failures (non-2xx HTTP responses) are surfaced immediately — retrying
     // those just doubles user-visible latency.
@@ -629,11 +699,7 @@ export class AgentShield {
       try {
         res = await fetch(url, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${credential}`,
-            'User-Agent': SDK_USER_AGENT,
-          },
+          headers,
           body,
           signal: AbortSignal.timeout(this.timeoutMs),
         });
@@ -666,6 +732,7 @@ export class AgentShield {
     }
 
     const data = await res.json();
+    if (receiptRequest) return this.verifyReceipt(data, receiptRequest, tokensReplaced);
     return {
       decision: data.decision,
       reason: data.reason,
@@ -725,6 +792,9 @@ export class AgentShield {
       ...lineageFields,
     });
 
+    const receiptRequest = this.prepareReceiptRequest(
+      '/decide', headers, JSON.parse(body), requestId
+    );
     let res: Response | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -753,6 +823,7 @@ export class AgentShield {
       throw new ShieldConsoleError(res.status, detail);
     }
     const data = await res.json();
+    if (receiptRequest) return this.verifyReceipt(data, receiptRequest, tokensReplaced);
     const raw = data.decision;
     if (raw && typeof raw === 'object') {
       const outcome = String(raw.outcome || '').toUpperCase();
