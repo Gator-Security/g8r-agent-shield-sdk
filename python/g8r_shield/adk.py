@@ -5,7 +5,13 @@ Install:  pip install "g8r-shield[adk]"
     from g8r_shield import AgentShield
     from g8r_shield.adk import ShieldPlugin
 
-    shield = AgentShield(tenant_id=..., console_url=..., api_key=..., agent_id="support-bot")
+    shield = AgentShield(
+        tenant_id=...,
+        pep_url=...,
+        console_url=...,
+        api_key=...,
+        agent_id="support-bot",
+    )
 
     runner = Runner(
         agent=root_agent,

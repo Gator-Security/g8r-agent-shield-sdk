@@ -106,7 +106,7 @@ Evaluate a prompt and conditionally execute the LLM call. The interaction is log
 - `factory` — Zero-argument callable that creates the LLM call. Only invoked when the policy decision is `allowed` or `escalated`.
 - `prompt` — The text to evaluate.
 - Raises `ShieldBlockedError` when the policy decision is `blocked`.
-- Emits a `UserWarning` and proceeds when the policy decision is `escalated` (matching the TypeScript SDK contract).
+- Emits a structured `action_escalated` log line and proceeds when the policy decision is `escalated` (matching the TypeScript SDK contract).
 - Propagates governance lineage automatically — see [Sub-agent lineage](#sub-agent-lineage).
 
 ### `shield.run(session_id: str | None = None)`
