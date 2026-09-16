@@ -48,7 +48,7 @@ const shield = new AgentShield({ tenantId: tenantId('acme-corp') });
 
 ### Authenticating with short-lived credentials (`credentialProvider`)
 
-The Console accepts either the deployment **shared secret** or a **verified OIDC JWT** (workload identity — e.g. AWS) in the same `Authorization: Bearer` header. For JWTs — which expire — pass a `credentialProvider` instead of a static `apiKey`. The provider is awaited **fresh on every `/check` and `/log` request**, so a rotated token is always picked up:
+The Console accepts either the deployment **shared secret** or a **verified OIDC JWT** (workload identity — e.g. AWS) in the same `Authorization: Bearer` header. For JWTs — which expire — pass a `credentialProvider` instead of a static `apiKey`. The provider is awaited **fresh on every `/decide`, `/check`, and `/log` request**, so a rotated token is always picked up:
 
 ```typescript
 const shield = new AgentShield({
@@ -99,11 +99,11 @@ An admin-**denied** agent returns `blocked` with `requiresApproval: false` in bo
 The primary integration point. Runs the full pipeline:
 
 1. **Redact** — `redactSensitiveData(prompt)` strips secrets locally
-2. **Check** — POST redacted prompt to `/api/sdk/v1/check` (policy evaluation)
-3. **Log** — POST audit entry to `/api/sdk/v1/log`
+2. **Decide** — POST redacted prompt to `{pepUrl}/decide` (one PEP policy hop)
+3. **Log** — POST audit entry to Console `/api/sdk/v1/log`
 4. **Invoke** — call `factory()` only if decision is `allowed`, or `escalated` while `blockOnEscalated` is `false`
 
-If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` runs the `/check` evaluation and then a single `/log`, both under one `requestId` and one resolved [lineage](#sub-agent-lineage), so `/check` and `/log` correlate under a single id with no duplicate audit entry. When allowed (or escalated-and-proceeding), the factory runs inside an ambient scope so nested `wrap()` calls inherit the session and parent-agent chain automatically.
+If blocked, throws `ShieldBlockedError` — the factory is **never called**. If `escalated` and the shield was constructed with `blockOnEscalated: true`, it also throws `ShieldBlockedError`; otherwise an escalated action proceeds with a warning (pending out-of-band human review). Internally `wrap()` runs PEP `/decide` and then a single `/log`, both under one `requestId` and one resolved [lineage](#sub-agent-lineage), so the policy hop and the audit line correlate under a single id. `wrap()` never POSTs Console `/api/sdk/v1/check`. That remaining hop is `check()` only. When allowed (or escalated-and-proceeding), the factory runs inside an ambient scope so nested `wrap()` calls inherit the session and parent-agent chain automatically.
 
 ```typescript
 try {
