@@ -6,19 +6,26 @@ pushed. You should not need to run `npm publish` from a laptop.
 
 ## One-time setup
 
-Add an npm **automation** token as a repository (or org) secret named
-`NPM_TOKEN`:
+### npm Trusted Publishing (OIDC) — required
 
-1. On npmjs.com, signed in as a member of the `g8r-security` org with publish
-   rights, create an **Automation** access token (Account → Access Tokens →
-   Generate New Token → Automation). Automation tokens bypass 2FA, which is what
-   lets CI publish non-interactively.
-2. In this repo: Settings → Secrets and variables → Actions → New repository
-   secret → name `NPM_TOKEN`, value the token.
+The workflow publishes via **npm Trusted Publishing** (OIDC), which authenticates
+the workflow without storing any tokens. On npmjs.com, signed in as a member of
+the `g8r-security` org with publish rights:
+
+**Publishing access → Trusted Publishers → Add provider → GitHub Actions**:
+- **Owner**: `Gator-Security`
+- **Repository**: `g8r-agent-shield-sdk`
+- **Workflow**: `release.yml`
 
 The workflow publishes with `--provenance`, which attests on npm that the
 package was built from this repo at this commit. That requires the `id-token:
 write` permission (already set in the workflow) and a public repo (this one).
+
+### NPM_TOKEN secret — deprecated (removed)
+
+**Prior releases used an npm Automation token stored in `NPM_TOKEN`.** That path
+is deprecated and has been removed from the workflow — Trusted Publishing is now
+the sole authentication method.
 
 ## Cutting a release
 
