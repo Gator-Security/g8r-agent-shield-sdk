@@ -20,6 +20,8 @@ the `g8r-security` org with publish rights:
 The workflow publishes with `--provenance`, which attests on npm that the
 package was built from this repo at this commit. That requires the `id-token:
 write` permission (already set in the workflow) and a public repo (this one).
+The workflow upgrades npm to ≥11.5.1 (Node 22.14 alone ships npm 10.x, which
+lacks OIDC support for Trusted Publishing).
 
 ### NPM_TOKEN secret — deprecated (removed)
 

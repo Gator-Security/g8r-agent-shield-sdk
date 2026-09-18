@@ -27,6 +27,12 @@ jobs:
           node-version: '22.14'
           registry-url: 'https://registry.npmjs.org'
 
+      - name: Ensure npm supports Trusted Publishing OIDC
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+          node -e "const [maj,min,pat]=require('child_process').execSync('npm -v').toString().trim().split('.').map(Number); if(maj<11||(maj===11&&min<5)||(maj===11&&min===5&&pat<1)){console.error('need npm>=11.5.1 got '+[maj,min,pat].join('.')); process.exit(1)}"
+
       - run: npm ci
 
       # Run every gate before publishing — a tag should never ship unverified.
