@@ -4,7 +4,7 @@ name: Release
 # Cut a release with:
 #   cd js && npm version patch        # bumps package.json + creates the v<x> tag
 #   git push --follow-tags
-# See RELEASING.md for the full process and required secrets.
+# See RELEASING.md for the full process (publishes via npm Trusted Publishing / OIDC).
 on:
   push:
     tags:
@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22.14'
           registry-url: 'https://registry.npmjs.org'
 
       - run: npm ci
@@ -48,5 +48,3 @@ jobs:
 
       - name: Publish
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
