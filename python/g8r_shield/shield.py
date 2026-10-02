@@ -218,8 +218,8 @@ class PolicyDecision:
     def is_pending_registration(self) -> bool:
         """Whether this decision means "agent awaiting admin approval".
 
-        v2 Consoles register agents trust-on-first-use: the FIRST call from
-        an unknown ``agent_id`` auto-creates a pending registration in the
+        v2 Consoles register agents trust-on-first-use: the first ``check()``
+        from an unknown ``agent_id`` files a pending registration in the
         Console's Approvals queue. What the SDK observes next depends on the
         server's pending-agent mode:
 
@@ -227,19 +227,21 @@ class PolicyDecision:
           evaluate normally under policy while admins approve in the
           background. The caller sees ordinary decisions; this property
           stays False.
-        * **block** — calls from the pending agent return ``blocked`` with
-          ``requires_approval`` set until an admin approves it. On this
-          path ``wrap()`` raises :class:`ShieldBlockedError`, which carries
-          the same ``decision`` / ``requires_approval`` pair (and mirrors
-          this property), so integrators can distinguish "awaiting admin
-          approval in the Approvals queue" from "policy blocked".
+        * **block** — ``check()`` returns ``blocked`` with
+          ``requires_approval`` set until an admin approves the agent, so
+          this property reads True. ``wrap()`` does not report it: it
+          evaluates at the PEP gateway, which holds a pending agent only
+          with receipt verification on, and then as a plain block, so the
+          :class:`ShieldBlockedError` it raises reads False. Call
+          ``check()`` to distinguish "awaiting admin approval in the
+          Approvals queue" from "policy blocked".
 
         On v2, ``decision == "blocked"`` together with ``requires_approval``
-        occurs ONLY for a pending registration in block mode — that
-        conjunction IS the pending signal. An admin-DENIED agent comes back
-        as ``blocked`` withOUT ``requires_approval``, so it correctly reads
-        False here. Branch on this property, never on the human-readable
-        ``reason`` string.
+        occurs ONLY for a pending registration on ``check()`` in block
+        mode — that conjunction IS the pending signal. An admin-DENIED
+        agent comes back as ``blocked`` withOUT ``requires_approval``, so
+        it correctly reads False here. Branch on this property, never on
+        the human-readable ``reason`` string.
         """
         return self.decision == "blocked" and self.requires_approval
 
@@ -259,9 +261,8 @@ class ShieldBlockedError(Exception):
         self.decision = decision.decision
         self.reason = decision.reason
         self.violated_rule = decision.violated_rule
-        # Carried so handlers can evaluate the v2 pending-registration signal
-        # (blocked + requires_approval) without re-fetching the decision —
-        # see `is_pending_registration` below.
+        # Carried so the error exposes the same flags as the decision that
+        # raised it — see `is_pending_registration` below.
         self.requires_approval = decision.requires_approval
         self.session_revoked = decision.session_revoked
         self.compliance_mappings = decision.compliance_mappings
@@ -270,10 +271,12 @@ class ShieldBlockedError(Exception):
     def is_pending_registration(self) -> bool:
         """Mirror of :attr:`PolicyDecision.is_pending_registration`.
 
-        True when this block means "agent awaiting admin approval in the
-        Console's Approvals queue" (v2 trust-on-first-use registration,
-        server in block mode) rather than a policy rejection. See the
-        :class:`PolicyDecision` property for the full contract.
+        Reads False on errors from ``wrap()``: the PEP gateway refuses a
+        pending agent with a plain block, not the blocked +
+        ``requires_approval`` pending signal. Call ``check()`` to tell
+        "agent awaiting admin approval in the Console's Approvals queue"
+        from a policy rejection. See the :class:`PolicyDecision` property
+        for the full contract.
         """
         return self.decision == "blocked" and self.requires_approval
 

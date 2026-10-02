@@ -101,6 +101,30 @@ def test_check_returns_verified_deny_and_receipt(monkeypatch):
     assert result.decision_receipt is not None and len(result.decision_receipt.split(".")) == 3
 
 
+def test_wrap_pending_registration_hold_is_a_plain_block(monkeypatch):
+    # The PEP signs a pending agent's hold (server in block mode) as a plain block, so wrap()
+    # raises without the pending signal: the SDK reports what the receipt says, nothing more.
+    install_transport(monkeypatch, lambda r, _: dict(
+        receipt=sign(r, dict(decision("blocked"), reason="AGENT_PENDING_APPROVAL"))))
+    called = []
+    with pytest.raises(ShieldBlockedError) as exc_info:
+        AgentShield(**CONFIG).wrap(lambda: called.append(True), "demo:first-call")
+    assert not called
+    assert exc_info.value.reason == "AGENT_PENDING_APPROVAL"
+    assert exc_info.value.requires_approval is False
+    assert exc_info.value.is_pending_registration is False
+
+
+def test_check_reports_pending_registration_from_receipt(monkeypatch):
+    # The Console's check() answer for a pending agent (server in block mode) is blocked with
+    # requiresApproval, the pending signal, and it survives receipt verification.
+    install_transport(monkeypatch, lambda r, _: dict(
+        receipt=sign(r, dict(decision("blocked"), requiresApproval=True))))
+    result = AgentShield(**CONFIG).check("demo:first-call", log=False)
+    assert result.is_pending_registration is True
+    assert result.decision_receipt is not None
+
+
 @pytest.mark.parametrize("fault", ["missing", "wrong-request", "tampered", "wrong-algorithm", "contradictory-allow"])
 def test_invalid_receipt_never_executes(monkeypatch, fault):
     def response(request, _):
