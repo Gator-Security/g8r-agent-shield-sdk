@@ -162,7 +162,7 @@ Context manager that manually appends `agent_id` as a parent hop for its block �
 | `compliance_mappings` | `list[ComplianceMapping]`  | Regulatory controls implicated by the decision       |
 | `redacted_tokens`     | `list[str]`                | Sensitive tokens stripped from the prompt by the local-first redaction layer before it reached the gateway; empty when the prompt was clean |
 | `decision_receipt`    | `str \| None`              | Verified compact JWS when `receipt_verification` is set. `None` in unsigned mode. |
-| `is_pending_registration` | `bool` (read-only property) | `True` only when `decision == "blocked"` and `requires_approval` — the v2 signal that the agent's registration is awaiting admin approval. See [Agent registration](#agent-registration-trust-on-first-use) |
+| `is_pending_registration` | `bool` (read-only property) | `True` only when `decision == "blocked"` and `requires_approval` — the v2 signal that the agent's registration is awaiting admin approval. Only `check()` returns it (Console in block mode). See [Agent registration](#agent-registration-trust-on-first-use) |
 
 ### `ShieldBlockedError`
 
@@ -174,7 +174,7 @@ Context manager that manually appends `agent_id` as a parent hop for its block �
 | `requires_approval`   | `bool`                     | Whether human approval is required                   |
 | `session_revoked`     | `bool`                     | Whether the agent session was revoked                |
 | `compliance_mappings` | `list[ComplianceMapping]`  | Compliance frameworks and controls violated          |
-| `is_pending_registration` | `bool` (read-only property) | Mirror of `PolicyDecision.is_pending_registration` — distinguishes "awaiting admin approval" from "policy blocked" without a second round-trip |
+| `is_pending_registration` | `bool` (read-only property) | Mirror of `PolicyDecision.is_pending_registration`. Reads `False` on errors from `wrap()`: the PEP gateway refuses a pending agent with a plain block, so ask `check()` to tell "awaiting admin approval" from "policy blocked". See [Agent registration](#agent-registration-trust-on-first-use) |
 
 ### `ComplianceMapping`
 
@@ -249,12 +249,17 @@ shield = AgentShield(
 
 ## Agent registration (trust-on-first-use)
 
-The **first** call from an unknown `agent_id` automatically creates a *pending* registration in the Console's Approvals queue. What happens next depends on the Console's pending-agent mode:
+The Console registers an unknown `agent_id` on first contact: the first `check()` from it files a *pending* registration in the Console's Approvals queue. With `receipt_verification` set, the PEP gateway can also register the agent on `wrap()`. Without it, `wrap()` and its audit log do not register the agent, so call `check()` once (for example at startup) to put a new agent in the queue.
+
+What happens while the registration is pending depends on the Console's pending-agent mode:
 
 - **flag** (server default) — calls from the pending agent evaluate normally under policy while admins approve in the background. Your integration needs no changes.
-- **block** — calls from the pending agent return `blocked` with `requires_approval` until an admin approves it, so `wrap()` raises `ShieldBlockedError`.
+- **block** — the agent is held until an admin approves it:
+  - `check()` returns `decision == "blocked"` together with `requires_approval`. That conjunction is the pending signal, and the SDK exposes it as `is_pending_registration`.
+  - `wrap()` with `receipt_verification` raises `ShieldBlockedError`, but the gateway signs the hold as a plain block (`requires_approval` is `False`), so `err.is_pending_registration` reads `False`.
+  - `wrap()` without `receipt_verification` is not held for registration; its calls are evaluated under policy as usual.
 
-On v2, `decision == "blocked"` together with `requires_approval` occurs **only** for a pending registration — the SDK exposes that conjunction as `is_pending_registration` (on both `PolicyDecision` and `ShieldBlockedError`) so you can distinguish "awaiting admin approval" from "policy blocked" without parsing reason strings:
+Only `check()` reports the pending signal. To tell "awaiting admin approval" from "policy blocked", ask `check()` and branch on `is_pending_registration`, never on the reason string:
 
 ```python
 from g8r_shield import ShieldBlockedError
@@ -262,7 +267,7 @@ from g8r_shield import ShieldBlockedError
 try:
     result = shield.wrap(lambda: call_llm(prompt), prompt)
 except ShieldBlockedError as err:
-    if err.is_pending_registration:
+    if shield.check(prompt, log=False).is_pending_registration:
         print("Agent awaiting approval in the Console Approvals queue — retry later.")
     else:
         print("Blocked by policy:", err.violated_rule)

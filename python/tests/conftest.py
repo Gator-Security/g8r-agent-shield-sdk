@@ -107,6 +107,17 @@ def pep_kill_switch_response() -> dict:
     )
 
 
+def pep_pending_registration_response() -> dict:
+    """The decision the PEP gateway gives an agent whose registration is still
+    pending (server in block mode): a plain DENY. Nothing in it marks the hold
+    as pending, so wrap() reads it as an ordinary block."""
+    return pep_decide_response(
+        "DENY",
+        reason_code="AGENT_PENDING_APPROVAL",
+        explanation="agent pending registration approval (check the Approvals queue)",
+    )
+
+
 def allowed_response() -> dict:
     return {
         "decision": "allowed",
@@ -180,12 +191,14 @@ def escalated_response() -> dict:
 
 
 def pending_registration_response() -> dict:
-    """v2 trust-on-first-use, server in block mode: the agent's registration
-    sits in the Console Approvals queue, so calls come back blocked WITH
-    requiresApproval — the conjunction that IS the pending signal."""
+    """v2 trust-on-first-use, server in block mode: the Console's check()
+    answer while the agent's registration sits in the Approvals queue —
+    blocked WITH requiresApproval, the conjunction that IS the pending
+    signal. Only check() returns this shape; the PEP's /decide (wrap())
+    answers a pending agent with pep_pending_registration_response()."""
     return {
         "decision": "blocked",
-        "reason": "Agent registration pending approval in the Approvals queue.",
+        "reason": "agent pending registration approval (check the Approvals queue)",
         "violatedRule": None,
         "requiresApproval": True,
         "sessionRevoked": False,

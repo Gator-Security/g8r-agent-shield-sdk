@@ -58,6 +58,7 @@ from .conftest import (
     pep_blocked_response,
     pep_escalated_response,
     pep_kill_switch_response,
+    pep_pending_registration_response,
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1133,10 +1134,11 @@ class TestCredentialProvider:
 
 class TestIsPendingRegistration:
     """The v2 detection rule: decision=='blocked' AND requires_approval is
-    the ONLY conjunction a pending registration (server in block mode)
-    produces. Everything else — plain policy blocks, admin-denied agents,
-    escalations — must read False. Logic branches on the flags, never on
-    the human-readable reason string."""
+    the ONLY conjunction a pending registration produces, and only check()
+    returns it (server in block mode). Everything else — plain policy
+    blocks, admin-denied agents, escalations, and every wrap() answer —
+    must read False. Logic branches on the flags, never on the
+    human-readable reason string."""
 
     @staticmethod
     def _decision(decision: str, requires_approval: bool) -> PolicyDecision:
@@ -1182,21 +1184,34 @@ class TestIsPendingRegistration:
         assert decision.decision == "blocked"
         assert decision.is_pending_registration is False
 
+    @pytest.mark.parametrize(
+        ("body", "decision", "requires_approval"),
+        [
+            (pep_pending_registration_response(), "blocked", False),
+            (pep_blocked_response(), "blocked", False),
+            (pep_escalated_response(), "escalated", True),
+        ],
+        ids=["pending-registration-hold", "policy-deny", "require-approval"],
+    )
     @responses.activate
-    def test_wrap_raises_blocked_error_carrying_pending_signal(self, shield, mocker):
-        """Block mode: wrap() raises ShieldBlockedError with requires_approval
-        and the mirrored property, so handlers can branch 'awaiting admin
-        approval' vs. 'policy blocked' without a second round-trip."""
-        responses.add(responses.POST, DECIDE_URL, json=pending_registration_response(), status=200)
+    def test_wrap_never_reports_pending_registration(
+        self, strict_shield, mocker, body, decision, requires_approval
+    ):
+        """wrap() evaluates at the PEP's /decide, and no /decide answer
+        carries the pending signal: a pending agent's hold (server in block
+        mode) is a plain DENY, so wrap() raises an ordinary block. Only
+        check() reports it — see test_pending_response_parsed_from_wire."""
+        responses.add(responses.POST, DECIDE_URL, json=body, status=200)
         responses.add(responses.POST, LOG_URL, json=log_response(), status=200)
 
         factory = mocker.Mock()
         with pytest.raises(ShieldBlockedError) as exc_info:
-            shield.wrap(factory, "first call from a new agent")
+            strict_shield.wrap(factory, "first call from a new agent")
 
         factory.assert_not_called()
-        assert exc_info.value.requires_approval is True
-        assert exc_info.value.is_pending_registration is True
+        assert exc_info.value.decision == decision
+        assert exc_info.value.requires_approval is requires_approval
+        assert exc_info.value.is_pending_registration is False
 
     @responses.activate
     def test_wrap_ordinary_block_is_not_pending(self, shield):
