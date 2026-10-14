@@ -67,7 +67,9 @@ from .conftest import (
 
 class TestConstruction:
     def test_defaults_applied(self):
-        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k")
+        s = AgentShield(
+            tenant_id="t1", pep_url=PEP_URL, console_url="https://x.example", api_key="k"
+        )
         assert s._department == "General"
         assert s._user_id == "unknown"
         assert s._ai_model == "unknown"
@@ -77,15 +79,16 @@ class TestConstruction:
 
     def test_console_url_env_fallback(self, monkeypatch):
         monkeypatch.setenv("G8R_CONSOLE_URL", "https://env.example.com/")
-        monkeypatch.setenv("G8R_API_KEY", "env-key")
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "env-key")
         s = AgentShield(tenant_id="t1", pep_url=PEP_URL)
         # Trailing slash should be stripped.
         assert s._console_url == "https://env.example.com"
-        assert s._api_key == "env-key"
+        assert s._bearer_credential() == "env-key"
 
     def test_explicit_args_override_env(self, monkeypatch):
         monkeypatch.setenv("G8R_CONSOLE_URL", "https://env.example.com")
-        monkeypatch.setenv("G8R_API_KEY", "env-key")
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "env-key")
         s = AgentShield(
             tenant_id="t1",
             pep_url=PEP_URL,
@@ -94,16 +97,18 @@ class TestConstruction:
         )
         assert s._console_url == "https://explicit.example.com"
         assert s._api_key == "explicit-key"
+        assert s._bearer_credential() == "explicit-key"
 
     def test_raises_when_no_api_key(self, monkeypatch):
-        monkeypatch.delenv("G8R_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="G8R API key is required"):
-            AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x")
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL", raising=False)
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
+        with pytest.raises(ValueError, match="per-tenant credential"):
+            AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="https://x.example")
 
     def test_raises_when_no_tenant_id(self):
         """Empty tenant_id must fail-fast at construction."""
         with pytest.raises(ValueError, match="tenant_id is required"):
-            AgentShield(tenant_id="", pep_url=PEP_URL, console_url="http://x", api_key="k")
+            AgentShield(tenant_id="", pep_url=PEP_URL, console_url="https://x.example", api_key="k")
 
     def test_raises_when_no_pep_url(self, monkeypatch):
         monkeypatch.delenv("G8R_PEP_URL", raising=False)
@@ -132,7 +137,13 @@ class TestConstruction:
             AgentShield(tenant_id="t1", pep_url=PEP_URL, api_key="k")
 
     def test_timeout_accepts_float(self):
-        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k", timeout=2.5)
+        s = AgentShield(
+            tenant_id="t1",
+            pep_url=PEP_URL,
+            console_url="https://x.example",
+            api_key="k",
+            timeout=2.5,
+        )
         assert s._timeout == 2.5
 
     def test_slots_blocks_ad_hoc_attributes(self, shield):
@@ -144,6 +155,8 @@ class TestConstruction:
             "_pep_url",
             "_console_url",
             "_api_key",
+            "_credential_file",
+            "_credential_env",
             "_credential_provider",
             "_tenant_id",
             "_department",
@@ -640,7 +653,8 @@ class TestPayloadShape:
         """When employee_name is None, log payload uses user_id."""
 
         s = AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_999",
@@ -698,7 +712,8 @@ class TestPayloadShape:
     @responses.activate
     def test_check_payload_omits_employee_name_when_none(self):
         s = AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_x",
@@ -1001,7 +1016,8 @@ class TestCredentialProvider:
     @staticmethod
     def _provider_shield(provider) -> AgentShield:
         return AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             credential_provider=provider,
         )
@@ -1017,7 +1033,8 @@ class TestCredentialProvider:
         """Two explicit credential sources is a config bug — fail fast."""
         with pytest.raises(ValueError, match="mutually exclusive"):
             AgentShield(
-                tenant_id="t1", pep_url=PEP_URL,
+                tenant_id="t1",
+                pep_url=PEP_URL,
                 console_url=CONSOLE_URL,
                 api_key="sk-static",
                 credential_provider=lambda: "jwt-abc",
@@ -1028,6 +1045,7 @@ class TestCredentialProvider:
         """A stale G8R_API_KEY left in the deployment env must never shadow
         the provider the caller opted into."""
         monkeypatch.setenv("G8R_API_KEY", "stale-env-secret")
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "stale-env-secret")
         s = self._provider_shield(lambda: "jwt-abc")
         responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
 
@@ -1081,19 +1099,25 @@ class TestCredentialProvider:
         assert len(responses.calls) == 0  # nothing reached the console
 
     def test_provider_exception_message_not_leaked(self):
-        """The provider's own message could carry token material; it lives on
-        __cause__ (opt-in), never in str(exc)."""
+        """The provider's own message could carry token material. It must not
+        be chained as __cause__ or __context__ — traceback printers emit both —
+        and it must not appear in str(exc)."""
+        import traceback
+
+        secret = "secret-jwt-material-do-not-echo"
 
         def provider() -> str:
-            raise RuntimeError("secret-jwt-material-do-not-echo")
+            raise RuntimeError(secret)
 
         s = self._provider_shield(provider)
 
         with pytest.raises(ShieldConnectionError) as exc_info:
             s.check("test", log=False)
 
-        assert "secret-jwt-material-do-not-echo" not in str(exc_info.value)
-        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert secret not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        formatted = "".join(traceback.format_exception(exc_info.value))
+        assert secret not in formatted
 
     @responses.activate
     def test_provider_failure_on_log_path_is_swallowed(self):
@@ -1229,7 +1253,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.6.0"
+    CANONICAL_VERSION = "0.7.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1241,6 +1265,8 @@ class TestCanonicalContract:
             "pep_url",
             "console_url",
             "api_key",
+            "credential_file",
+            "credential_env",
             "department",
             "user_id",
             "employee_name",
@@ -1275,6 +1301,8 @@ class TestCanonicalContract:
         }
         assert defaults["console_url"] is None
         assert defaults["api_key"] is None
+        assert defaults["credential_file"] is None
+        assert defaults["credential_env"] is None
         assert defaults["department"] == "General"
         assert defaults["user_id"] == "unknown"
         assert defaults["employee_name"] is None
@@ -1342,7 +1370,7 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.6.0 (lockstep) so 'are these in
+        """Both SDKs land on the SAME 0.7.0 (lockstep) so 'are these in
         parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 
@@ -1355,7 +1383,8 @@ class TestCanonicalContract:
     def test_repr_never_exposes_api_key(self):
         """Contract: api_key must never appear in repr/str."""
         s = AgentShield(
-            tenant_id="t1", pep_url=PEP_URL,
+            tenant_id="t1",
+            pep_url=PEP_URL,
             console_url="https://c.example.com",
             api_key="sk-super-secret-abc123",
         )
@@ -1377,7 +1406,8 @@ class TestCanonicalContract:
 def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
     """Build a shield against the mock console with a given agent_id."""
     return AgentShield(
-        tenant_id="tenant-test", pep_url=PEP_URL,
+        tenant_id="tenant-test",
+        pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         agent_id=agent_id,

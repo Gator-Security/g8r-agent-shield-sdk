@@ -15,7 +15,7 @@ import { tenantId } from '../src/ids';
 
 const providerConfig = {
   pepUrl: 'https://pep.test.example',
-  consoleUrl: 'http://localhost:3000',
+  consoleUrl: 'https://console.test.example',
   tenantId: tenantId('acme-inc'),
 };
 
@@ -47,6 +47,8 @@ describe('credentialProvider', () => {
     jest.restoreAllMocks();
     delete process.env.G8R_CONSOLE_URL;
     delete process.env.G8R_API_KEY;
+    delete process.env.G8R_TENANT_CREDENTIAL;
+    delete process.env.G8R_TENANT_CREDENTIAL_FILE;
   });
 
   describe('construction', () => {
@@ -90,9 +92,9 @@ describe('credentialProvider', () => {
 
       expect(provider).toHaveBeenCalledTimes(2);
       const calls = (global.fetch as jest.Mock).mock.calls;
-      expect(calls[0][0]).toBe('http://localhost:3000/api/sdk/v1/check');
+      expect(calls[0][0]).toBe('https://console.test.example/api/sdk/v1/check');
       expect(calls[0][1].headers.Authorization).toBe('Bearer jwt-1');
-      expect(calls[1][0]).toBe('http://localhost:3000/api/sdk/v1/log');
+      expect(calls[1][0]).toBe('https://console.test.example/api/sdk/v1/log');
       expect(calls[1][1].headers.Authorization).toBe('Bearer jwt-2');
     });
 
@@ -128,6 +130,7 @@ describe('credentialProvider', () => {
 
     it('ignores the G8R_API_KEY env fallback when a provider is configured', async () => {
       process.env.G8R_API_KEY = 'sk-from-env';
+      process.env.G8R_TENANT_CREDENTIAL = 'sk-from-env';
       mockFetchSequence([{ ok: true, body: allowedResponse }]);
       const shield = new AgentShield({
         ...providerConfig,
@@ -175,9 +178,10 @@ describe('credentialProvider', () => {
       expect(provider).toHaveBeenCalledTimes(1); // never retried — provider retry policy is the provider's
     });
 
-    it('surfaces as ShieldConnectionError naming the provider, with the rejection on .cause', async () => {
+    it('surfaces as ShieldConnectionError naming the provider, without chaining the rejection', async () => {
       global.fetch = jest.fn();
-      const rejection = new Error('sts endpoint unavailable');
+      const secret = 'sts-endpoint-token-do-not-echo';
+      const rejection = new Error(secret);
       const shield = new AgentShield({
         ...providerConfig,
         credentialProvider: () => Promise.reject(rejection),
@@ -190,12 +194,15 @@ describe('credentialProvider', () => {
         thrown = e as ShieldConnectionError;
       }
       expect(thrown).toBeInstanceOf(ShieldConnectionError);
-      expect(thrown!.consoleUrl).toBe('http://localhost:3000');
-      expect(thrown!.cause).toBe(rejection);
+      expect(thrown!.consoleUrl).toBe('https://console.test.example');
+      // The provider error can carry the credential. Do not attach it as
+      // .cause — Node prints that chain from console.error and inspect.
+      expect(thrown!.cause).toBeUndefined();
       expect(thrown!.message).toContain('credentialProvider');
-      // The message stays generic — the provider's own error text (which
-      // could carry anything) lives on .cause only.
-      expect(thrown!.message).not.toContain('sts endpoint unavailable');
+      expect(thrown!.message).not.toContain(secret);
+      expect(thrown!.stack ?? '').not.toContain(secret);
+      const { inspect } = await import('node:util');
+      expect(inspect(thrown)).not.toContain(secret);
     });
 
     it('a rejection on the audit (/log) path is swallowed like any /log failure — the decision path proceeds', async () => {

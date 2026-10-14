@@ -10,12 +10,13 @@
  *   import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
  *
  *   const shield = new AgentShield({
- *     // consoleUrl / apiKey can be omitted and resolved from the
- *     // G8R_CONSOLE_URL / G8R_API_KEY environment variables instead.
+ *     // consoleUrl can be omitted and resolved from G8R_CONSOLE_URL.
+ *     // The credential is per tenant or per agent, supplied at runtime.
+ *     // There is no shared or default secret.
  *     consoleUrl: 'https://shield.yourcompany.com',
- *     apiKey: 'sk-shield-...',
- *     // — or, for short-lived OIDC workload-identity JWTs, a provider that is
- *     // awaited fresh on every request (mutually exclusive with apiKey):
+ *     credentialFile: '/run/secrets/g8r-tenant-credential', // 1Password/broker mount
+ *     // — or credentialEnv: 'TENANT_ACME_CREDENTIAL',
+ *     // — or, for a short-lived token, a provider awaited fresh every request:
  *     // credentialProvider: () => mintWorkloadJwt(),
  *     tenantId: tenantId('acme-corp'),
  *     department: 'Finance',   // optional — defaults to 'General'
@@ -65,7 +66,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.6.0';
+export const VERSION = '0.7.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -83,9 +84,19 @@ const RETRY_BACKOFF_MS = 500;
 
 /** Environment variable fallbacks for deployment config (12-factor). */
 const ENV_CONSOLE_URL = 'G8R_CONSOLE_URL';
-const ENV_API_KEY = 'G8R_API_KEY';
 const ENV_PEP_URL = 'G8R_PEP_URL';
+/** Runtime supply for ONE tenant or agent in this process. Not a shared default. */
+const ENV_TENANT_CREDENTIAL = 'G8R_TENANT_CREDENTIAL';
+const ENV_TENANT_CREDENTIAL_FILE = 'G8R_TENANT_CREDENTIAL_FILE';
+/** Local-dev only. Permits http to loopback hosts and nothing else. */
+const ENV_ALLOW_INSECURE_LOCALHOST = 'G8R_ALLOW_INSECURE_LOCALHOST';
 const PEP_DECIDE_PATH = '/decide';
+
+const MISSING_CREDENTIAL =
+  'A per-tenant credential is required. Pass apiKey, credentialFile, or ' +
+  'credentialEnv for this tenant or agent, or set G8R_TENANT_CREDENTIAL or ' +
+  'G8R_TENANT_CREDENTIAL_FILE to a credential fetched at runtime (for example ' +
+  'from 1Password or the broker). There is no shared or default SDK secret.';
 
 const OUTCOME_TO_DECISION: Record<string, PolicyCheckResult['decision']> = {
   ALLOW: 'allowed',
@@ -94,21 +105,133 @@ const OUTCOME_TO_DECISION: Record<string, PolicyCheckResult['decision']> = {
   ERROR: 'blocked',
 };
 
+function localhostDevOverride(): boolean {
+  const raw = readEnv(ENV_ALLOW_INSECURE_LOCALHOST);
+  if (!raw) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * Parse an IPv4 dotted quad the way Python's ipaddress module does:
+ * four decimal octets, no leading zeros.
+ */
+function parseIpv4(text: string): number | null {
+  const parts = text.split('.');
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = (value * 256 + octet) >>> 0;
+  }
+  return value;
+}
+
+/** 127.0.0.0/8, or 0.0.0.0 which this SDK treats as loopback. */
+function ipv4IsLoopbackFamily(value: number): boolean {
+  if (value === 0) return true;
+  return (value >>> 24) === 127;
+}
+
+/** Eight hextets, or null when `text` is not an IPv6 address. */
+function parseIpv6Groups(text: string): number[] | null {
+  let body = text;
+  if (body.includes('.')) {
+    const lastColon = body.lastIndexOf(':');
+    if (lastColon < 0) return null;
+    const v4 = parseIpv4(body.slice(lastColon + 1));
+    if (v4 === null) return null;
+    const hi = (v4 >>> 16) & 0xffff;
+    const lo = v4 & 0xffff;
+    body = `${body.slice(0, lastColon + 1)}${hi.toString(16)}:${lo.toString(16)}`;
+  }
+  const halves = body.split('::');
+  if (halves.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (side === '') return [];
+    const groups = side.split(':');
+    const out: number[] = [];
+    for (const group of groups) {
+      if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+      out.push(parseInt(group, 16));
+    }
+    return out;
+  };
+  if (halves.length === 1) {
+    const groups = parseSide(halves[0]);
+    if (!groups || groups.length !== 8) return null;
+    return groups;
+  }
+  const left = parseSide(halves[0]);
+  const right = parseSide(halves[1]);
+  if (!left || !right) return null;
+  // `::` must compress at least one group.
+  if (left.length + right.length > 7) return null;
+  const missing = 8 - left.length - right.length;
+  return [...left, ...new Array<number>(missing).fill(0), ...right];
+}
+
+/**
+ * Loopback names and addresses. Same set as the Python SDK: localhost and
+ * `*.localhost` (a trailing DNS dot is ignored), 127.0.0.0/8, 0.0.0.0, ::,
+ * ::1, and any IPv4-mapped IPv6 address whose embedded IPv4 is one of those.
+ * Brackets and a zone id are stripped. Ports are not part of `host`.
+ */
+function isLoopbackHost(host: string): boolean {
+  let normalized = host.trim().toLowerCase();
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    normalized = normalized.slice(1, -1);
+  }
+  while (normalized.endsWith('.')) normalized = normalized.slice(0, -1);
+  const zone = normalized.indexOf('%');
+  if (zone !== -1) normalized = normalized.slice(0, zone);
+  if (!normalized) return false;
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) return true;
+  const v4 = parseIpv4(normalized);
+  if (v4 !== null) return ipv4IsLoopbackFamily(v4);
+  if (!normalized.includes(':')) return false;
+  const groups = parseIpv6Groups(normalized);
+  if (!groups) return false;
+  const mapped =
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff;
+  if (mapped) {
+    const embedded = ((groups[6] << 16) | groups[7]) >>> 0;
+    return ipv4IsLoopbackFamily(embedded);
+  }
+  if (groups.every((group) => group === 0)) return true;
+  return groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1;
+}
+
 function rejectLoopback(url: string, field: string): string {
   const cleaned = url.trim().replace(/\/+$/, '');
   if (!cleaned) {
     throw new Error(`${field} is required`);
   }
-  const host = cleaned.toLowerCase();
-  if (
-    host.includes('://localhost') ||
-    host.includes('://127.0.0.1') ||
-    host.includes('://[::1]') ||
-    host.startsWith('localhost') ||
-    host.startsWith('127.0.0.1')
-  ) {
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    throw new Error(`${field} must be an https URL`);
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const loopback = isLoopbackHost(host);
+  const override = localhostDevOverride();
+  if (loopback && !override) {
     throw new Error(
-      `${field} must not target localhost. An SDK that ships prompts must fail closed rather than silently talk to 127.0.0.1.`
+      `${field} must not target localhost. An SDK that ships prompts must fail closed rather than silently talk to 127.0.0.1. For local development set ${ENV_ALLOW_INSECURE_LOCALHOST}=1.`
+    );
+  }
+  const httpsOk = parsed.protocol === 'https:' && host.length > 0;
+  const localhostHttpOk = override && loopback && parsed.protocol === 'http:' && host.length > 0;
+  if (!httpsOk && !localhostHttpOk) {
+    throw new Error(
+      `${field} must be https. A localhost-only dev override is ${ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for loopback hosts (localhost, 127.0.0.0/8, ::1, and mapped loopback).`
     );
   }
   return cleaned;
@@ -132,46 +255,61 @@ export interface ShieldConfig {
   receiptVerification?: ReceiptVerificationConfig;
   /**
    * Base URL of the PEP gateway. Required: this field OR `G8R_PEP_URL`.
-   * No consoleUrl fallback. Loopback is refused. wrap() hops POST {pepUrl}/decide.
+   * No consoleUrl fallback. Must be https. Loopback is refused unless
+   * `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for loopback
+   * hosts (localhost and `*.localhost`, 127.0.0.0/8, 0.0.0.0, ::, ::1, and
+   * IPv4-mapped loopback). wrap() hops POST {pepUrl}/decide.
    */
   pepUrl?: string;
   /**
    * Base URL of the deployed G8R Console (audit /log and the check() gap).
    * Optional at the type level, but effectively required: resolved from this
    * field OR the `G8R_CONSOLE_URL` env var. If neither is present the
-   * constructor throws. Never defaults to localhost. A trailing slash is stripped.
+   * constructor throws. Must be https, with the same loopback rules as pepUrl.
+   * Never defaults to localhost. A trailing slash is stripped.
    */
   consoleUrl?: string;
   /**
-   * Static bearer credential for /api/sdk/v1/check and /log — the deployment
-   * shared secret the customer configured server-side. Optional at the type
-   * level, but effectively required unless `credentialProvider` is set:
-   * resolved from this field OR the `G8R_API_KEY` env var. If neither yields
-   * a non-empty value (and no provider is configured) the constructor throws.
-   * Never included in toString()/logs. Mutually exclusive with
-   * `credentialProvider`.
+   * This client's tenant or agent bearer credential, already fetched at
+   * runtime by the caller. There is no default. Never included in
+   * toString()/logs. Mutually exclusive with `credentialFile`,
+   * `credentialEnv`, and `credentialProvider`.
    */
   apiKey?: string;
   /**
+   * Filesystem path of this client's tenant or agent credential — for example
+   * a file written by 1Password or the broker. Read at construction (missing
+   * or empty refuses to start) and again on every request so a replaced file
+   * is picked up. The contents are never logged.
+   */
+  credentialFile?: string;
+  /**
+   * Name of the environment variable holding THIS client's credential. The
+   * SDK does not choose a process-wide name. Unset or empty refuses to start.
+   * The value is never logged.
+   */
+  credentialEnv?: string;
+  /**
    * Callback returning (or resolving to) the bearer credential for ONE
    * outbound request. Awaited fresh on EVERY /check and /log call, so
-   * short-lived credentials — e.g. OIDC workload-identity JWTs (AWS workload
-   * identity and friends) — never go stale inside a long-lived shield
-   * instance. The Console accepts either the deployment shared secret or a
-   * verified OIDC JWT in the same `Authorization: Bearer` header, so a static
-   * apiKey and a provider speak the identical wire contract. With a verified
-   * JWT the server trusts the JWT's tenant claim over the body's tenantId — a
-   * mismatch is HTTP 403 (a bad/missing credential is 401).
+   * short-lived per-tenant credentials — e.g. OIDC workload-identity JWTs —
+   * never go stale inside a long-lived shield instance. A static credential
+   * and a provider speak the same `Authorization: Bearer` wire contract.
+   * With a verified JWT the server trusts the JWT's tenant claim over the
+   * body's tenantId — a mismatch is HTTP 403 (a bad/missing credential is 401).
    *
-   * Mutually exclusive with `apiKey` — the constructor throws if both are
-   * passed, and the `G8R_API_KEY` env fallback is not consulted when a
-   * provider is configured. A provider rejection fails CLOSED: it surfaces as
-   * ShieldConnectionError and wrap() never invokes the LLM factory. The
-   * returned credential is used only for the Authorization header and is
-   * never logged.
+   * Mutually exclusive with the static sources above. When no explicit source
+   * is passed, `G8R_TENANT_CREDENTIAL` or `G8R_TENANT_CREDENTIAL_FILE`
+   * (exactly one) supplies the credential for this process. The constructor
+   * throws if none of these yields a credential. A provider rejection fails
+   * CLOSED: it surfaces as ShieldConnectionError and wrap() never invokes the
+   * LLM factory. The rejection is not attached as `cause` — a provider
+   * message can contain the credential, and a file or env failure can name
+   * the path or variable. The returned credential is used only for the
+   * Authorization header and is never logged.
    */
   credentialProvider?: () => string | Promise<string>;
-  /** Tenant this SDK instance operates on behalf of. The one hard-required field. */
+  /** Tenant this SDK instance operates on behalf of. Required; blank or whitespace is rejected. */
   tenantId: TenantId;
   /** Optional: functional department for governance attribution (defaults to "General"). */
   department?: string;
@@ -292,6 +430,7 @@ export class AgentShield {
   private readonly pepUrl: string;
   private readonly consoleUrl: string;
   private readonly credential: () => string | Promise<string>;
+  private readonly credentialKind: 'provider' | 'static';
   private readonly tenantId: TenantId;
   private readonly department: string;
   private readonly userId: string;
@@ -305,7 +444,7 @@ export class AgentShield {
   private readonly receiptVerifier?: ReceiptVerifier;
 
   constructor(config: ShieldConfig) {
-    if (!config.tenantId) {
+    if (!config.tenantId || !String(config.tenantId).trim()) {
       throw new Error('tenantId is required');
     }
 
@@ -327,40 +466,67 @@ export class AgentShield {
       );
     }
 
-    // A static key and a per-request provider are two mutually exclusive
-    // answers to "where does the bearer credential come from". Refuse the
-    // ambiguity outright — silently preferring one usually hides a config
-    // merge bug upstream.
-    if (config.apiKey && config.credentialProvider) {
+    // Each client has exactly one credential source. Refusing the ambiguity
+    // outright — silently preferring one usually hides a config merge bug.
+    // The error names the sources only, never a credential value.
+    const explicitKey = config.apiKey?.trim() ? config.apiKey.trim() : undefined;
+    const explicitFile = config.credentialFile?.trim() || undefined;
+    const explicitEnv = config.credentialEnv?.trim() || undefined;
+    const sources = [
+      explicitKey ? 'apiKey' : '',
+      explicitFile ? 'credentialFile' : '',
+      explicitEnv ? 'credentialEnv' : '',
+      config.credentialProvider ? 'credentialProvider' : '',
+    ].filter((name) => name.length > 0);
+    if (sources.length > 1) {
       throw new Error(
-        'apiKey and credentialProvider are mutually exclusive. Pass exactly one credential source.'
+        'apiKey, credentialFile, credentialEnv, and credentialProvider are mutually exclusive. Pass exactly one credential source.'
       );
     }
 
-    // Resolve the credential SOURCE — never the credential itself: a provider
-    // is awaited per request (see resolveCredential()), not at construction.
-    // A static key is normalized into the same closure shape as a provider so
-    // /check and /log share one resolution path. When a provider is
-    // configured the G8R_API_KEY env fallback is deliberately not consulted —
-    // an explicit provider is an explicit choice of credential source.
+    // Resolve the credential SOURCE. A provider is awaited per request
+    // (see resolveCredential()). A file or named env var is re-read per
+    // request so a broker can rotate it. An explicit source wins over the
+    // process env; that env is not a shared default.
     let credential: () => string | Promise<string>;
+    let credentialKind: 'provider' | 'static' = 'static';
     if (config.credentialProvider) {
       credential = config.credentialProvider;
+      credentialKind = 'provider';
+    } else if (explicitKey) {
+      credential = () => explicitKey;
+    } else if (explicitFile) {
+      readCredentialFile(explicitFile);
+      credential = () => readCredentialFile(explicitFile);
+    } else if (explicitEnv) {
+      readCredentialEnv(explicitEnv);
+      credential = () => readCredentialEnv(explicitEnv);
     } else {
-      const resolvedKey = config.apiKey || readEnv(ENV_API_KEY);
-      if (!resolvedKey) {
+      const fileEnv = readEnv(ENV_TENANT_CREDENTIAL_FILE)?.trim();
+      const valueEnv = readEnv(ENV_TENANT_CREDENTIAL)?.trim();
+      if (fileEnv && valueEnv) {
         throw new Error(
-          `apiKey is required. Pass apiKey, set the ${ENV_API_KEY} env var, or pass a credentialProvider.`
+          'G8R_TENANT_CREDENTIAL and G8R_TENANT_CREDENTIAL_FILE are both set. ' +
+            'Pass one per-tenant credential source. There is no shared or default SDK secret.'
         );
       }
-      credential = () => resolvedKey;
+      if (fileEnv) {
+        readCredentialFile(fileEnv);
+        credential = () => readCredentialFile(fileEnv);
+      } else if (valueEnv) {
+        credential = () => readCredentialEnv(ENV_TENANT_CREDENTIAL);
+      } else {
+        throw new Error(MISSING_CREDENTIAL);
+      }
     }
 
     // Store all fields (with defaults applied) as write-once instance state.
     // The instance holds no mutable state and is safe to share across loops.
-    this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
+    // consoleUrl uses the same https + loopback rules as pepUrl.
+    this.consoleUrl = rejectLoopback(resolvedUrl, 'consoleUrl');
     this.pepUrl = rejectLoopback(resolvedPep, 'pepUrl');
     this.credential = credential;
+    this.credentialKind = credentialKind;
     this.tenantId = config.tenantId;
     this.department = config.department ?? DEFAULT_DEPARTMENT;
     this.userId = config.userId ?? DEFAULT_USER_ID;
@@ -952,18 +1118,28 @@ export class AgentShield {
    */
   private async resolveCredential(): Promise<string> {
     try {
-      return await this.credential();
-    } catch (err) {
-      // Log the failure (never the credential — there is none to leak, and
-      // the provider's error is preserved on `.cause` rather than stringified
-      // into a log line that downstream pipelines might surface).
-      log.error('credential_provider_failed', { tenant_id: this.tenantId });
-      throw new ShieldConnectionError(
-        this.consoleUrl,
-        err,
-        '[G8R Shield] credentialProvider rejected — no request was sent to the console. ' +
-          'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
+      const credential = (await this.credential()).trim();
+      if (!credential) {
+        throw new Error('resolved credential is empty');
+      }
+      return credential;
+    } catch {
+      // Log the failure class, never the credential and never the underlying
+      // error. A provider error can embed the token, and a file or env
+      // failure names the path or variable. Attaching either as `cause`
+      // would print it from console.error / inspect.
+      log.error(
+        this.credentialKind === 'provider'
+          ? 'credential_provider_failed'
+          : 'credential_resolution_failed',
+        { tenant_id: this.tenantId }
       );
+      const detail =
+        this.credentialKind === 'provider'
+          ? 'credentialProvider rejected — no request was sent to the console. ' +
+            'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
+          : 'The per-tenant credential could not be read. No request was sent.';
+      throw new ShieldConnectionError(this.consoleUrl, undefined, `[G8R Shield] ${detail}`);
     }
   }
 }
@@ -1042,8 +1218,10 @@ export class ShieldConsoleError extends Error {
  * Also thrown when a configured credentialProvider rejects: no request can
  * leave the process without a credential, which is the same
  * "could not complete the exchange" failure mode — the `message` override
- * names the provider so operators aren't sent chasing a healthy console, and
- * `.cause` carries the provider's rejection.
+ * names the provider so operators aren't sent chasing a healthy console.
+ * A credential-resolution failure is not stored on `.cause`: a provider
+ * rejection can contain the credential, and a file or env failure can name
+ * the path or variable. Node prints that chain.
  */
 export class ShieldConnectionError extends Error {
   public readonly consoleUrl: string;
@@ -1062,6 +1240,99 @@ export class ShieldConnectionError extends Error {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+const FS_UNAVAILABLE = 'ERR_FS_UNAVAILABLE';
+
+function fsUnavailable(): Error {
+  const err = new Error(
+    'credentialFile requires the Node.js filesystem. Browser and edge runtimes must pass apiKey or credentialProvider.'
+  );
+  (err as { code?: string }).code = FS_UNAVAILABLE;
+  return err;
+}
+
+function isFsUnavailable(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ('code' in err && (err as { code?: unknown }).code === FS_UNAVAILABLE) return true;
+  return err instanceof Error && err.message.includes('Dynamic require of');
+}
+
+/**
+ * Load `fs.readFileSync` only when a credential file is actually read.
+ *
+ * A top-level `import from 'node:fs'` is evaluated by browser and edge
+ * bundlers even when the caller uses apiKey or credentialProvider, and the
+ * bundle fails to resolve the builtin. `process.getBuiltinModule` (Node
+ * 20.16+) needs no static import. The `require` fallback is inside try/catch
+ * — the same shape as the async_hooks load in context.ts — so a bundler
+ * treats it as optional instead of failing the build. Node 18 CommonJS uses
+ * that fallback; Node 18 ESM has neither and gets the clear error.
+ */
+function nodeReadFileSync(): (path: string, options: { encoding: 'utf8' }) => string {
+  const proc = typeof process === 'undefined' ? undefined : process;
+  if (proc?.versions?.node == null) {
+    throw fsUnavailable();
+  }
+  if (typeof proc.getBuiltinModule === 'function') {
+    const fs = proc.getBuiltinModule('node:fs') as {
+      readFileSync?: (path: string, options: { encoding: 'utf8' }) => string;
+    };
+    if (typeof fs?.readFileSync === 'function') {
+      return fs.readFileSync;
+    }
+  }
+  try {
+    if (typeof require === 'function') {
+      const fs = require('node:fs') as {
+        readFileSync: (path: string, options: { encoding: 'utf8' }) => string;
+      };
+      return fs.readFileSync;
+    }
+  } catch (err) {
+    if (isFsUnavailable(err) || (err instanceof Error && err.message.includes('Dynamic require'))) {
+      throw fsUnavailable();
+    }
+    throw err;
+  }
+  throw fsUnavailable();
+}
+
+/** Read a tenant/agent credential file. The contents are never logged. */
+function readCredentialFile(path: string): string {
+  let raw: string;
+  try {
+    raw = nodeReadFileSync()(path, { encoding: 'utf8' });
+  } catch (err) {
+    if (isFsUnavailable(err)) {
+      throw err instanceof Error ? err : fsUnavailable();
+    }
+    const code =
+      err && typeof err === 'object' && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : 'Error';
+    throw new Error(
+      `credentialFile ${JSON.stringify(path)} could not be read (${code}). A per-tenant credential is required.`
+    );
+  }
+  const credential = raw.trim();
+  if (!credential) {
+    throw new Error(
+      `credentialFile ${JSON.stringify(path)} is empty. A per-tenant credential is required.`
+    );
+  }
+  return credential;
+}
+
+/** Read a tenant/agent credential from a named env var. The value is never logged. */
+function readCredentialEnv(name: string): string {
+  const credential = (readEnv(name) ?? '').trim();
+  if (!credential) {
+    throw new Error(
+      `Environment variable ${name} is unset or empty. A per-tenant credential is required.`
+    );
+  }
+  return credential;
+}
 
 /** Read an environment variable, tolerating environments without `process`. */
 function readEnv(name: string): string | undefined {

@@ -4,6 +4,7 @@ Core AgentShield class — wraps the G8R Console REST API.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import time
 import uuid
@@ -11,6 +12,7 @@ from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -53,6 +55,20 @@ _RETRY_BACKOFF_SECONDS = 0.5
 
 _ENV_PEP_URL = "G8R_PEP_URL"
 _ENV_CONSOLE_URL = "G8R_CONSOLE_URL"
+# Runtime supply for ONE tenant or agent in this process. Never a deployment-wide
+# default: each client can instead be given its own file or env var name.
+_ENV_TENANT_CREDENTIAL = "G8R_TENANT_CREDENTIAL"
+_ENV_TENANT_CREDENTIAL_FILE = "G8R_TENANT_CREDENTIAL_FILE"
+# Local-dev only. Permits http to loopback hosts and nothing else.
+_ENV_ALLOW_INSECURE_LOCALHOST = "G8R_ALLOW_INSECURE_LOCALHOST"
+_DEV_OVERRIDE_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+_MISSING_CREDENTIAL = (
+    "A per-tenant credential is required. Pass api_key, credential_file, or "
+    "credential_env for this tenant or agent, or set G8R_TENANT_CREDENTIAL or "
+    "G8R_TENANT_CREDENTIAL_FILE to a credential fetched at runtime (for example "
+    "from 1Password or the broker). There is no shared or default SDK secret."
+)
 
 # wrap() hops PEP POST /decide (the SDK facade on the same gateway as /proxy).
 # /proxy forwards to a downstream URL; wrap() is decide-then-factory, so /decide
@@ -67,22 +83,118 @@ _OUTCOME_TO_DECISION = {
 }
 
 
+def _nonempty(value: str | None) -> str | None:
+    """Return stripped text, or None when missing or blank."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _read_credential_file(path: str) -> str:
+    """Read a tenant/agent credential from a file. The value is never logged."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"credential_file {path!r} is not UTF-8 text. A per-tenant credential is required."
+        ) from None
+    except OSError as exc:
+        raise ValueError(
+            f"credential_file {path!r} could not be read ({type(exc).__name__}). "
+            "A per-tenant credential is required."
+        ) from None
+    credential = raw.strip()
+    if not credential:
+        raise ValueError(f"credential_file {path!r} is empty. A per-tenant credential is required.")
+    return credential
+
+
+def _read_credential_env(name: str) -> str:
+    """Read a tenant/agent credential from a named env var. The value is never logged."""
+    credential = (os.environ.get(name) or "").strip()
+    if not credential:
+        raise ValueError(
+            f"Environment variable {name} is unset or empty. A per-tenant credential is required."
+        )
+    return credential
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback names and addresses.
+
+    Covers ``localhost`` and ``*.localhost`` (a trailing DNS dot is ignored),
+    ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``, and any IPv4-mapped IPv6
+    address whose embedded IPv4 is one of those. Brackets and a zone id are
+    stripped. Ports are not part of ``host``; callers pass the URL hostname.
+    """
+    normalized = host.strip().lower()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    while normalized.endswith("."):
+        normalized = normalized[:-1]
+    zone = normalized.find("%")
+    if zone != -1:
+        normalized = normalized[:zone]
+    if not normalized:
+        return False
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        parsed = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if isinstance(parsed, ipaddress.IPv6Address):
+        mapped = parsed.ipv4_mapped
+        if mapped is not None:
+            # Unwrap so 3.10–3.12 (where IPv6.is_loopback is only ::1) agree
+            # with 3.13+, which delegates mapped addresses to the IPv4 check.
+            parsed = mapped
+    return parsed.is_loopback or parsed.is_unspecified
+
+
+def _localhost_dev_override() -> bool:
+    """True only for an explicit localhost dev override. Anything else is off."""
+    raw = os.environ.get(_ENV_ALLOW_INSECURE_LOCALHOST)
+    if not raw:
+        return False
+    return raw.strip().lower() in _DEV_OVERRIDE_TRUTHY
+
+
 def _reject_loopback(url: str, field: str) -> str:
-    """Strip trailing slash; refuse empty and loopback targets."""
+    """Normalize a console or PEP base URL.
+
+    HTTPS is required. Loopback targets are refused so a misconfigured agent
+    cannot ship prompts to 127.0.0.1. ``G8R_ALLOW_INSECURE_LOCALHOST=1``
+    permits ``http`` only for loopback hosts: localhost and ``*.localhost``,
+    ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``, and IPv4-mapped loopback
+    (https on those hosts is allowed too). It does not permit plaintext to
+    any other host.
+    """
     cleaned = url.strip().rstrip("/")
     if not cleaned:
         raise ValueError(f"{field} is required")
-    host = cleaned.lower()
-    if (
-        "://localhost" in host
-        or "://127.0.0.1" in host
-        or "://[::1]" in host
-        or host.startswith("localhost")
-        or host.startswith("127.0.0.1")
-    ):
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        raise ValueError(f"{field} must be an https URL") from None
+    host = parsed.hostname or ""
+    loopback = _is_loopback_host(host)
+    override = _localhost_dev_override()
+    if loopback and not override:
         raise ValueError(
             f"{field} must not target localhost. An SDK that ships prompts must "
-            "fail closed rather than silently talk to 127.0.0.1."
+            "fail closed rather than silently talk to 127.0.0.1. For local "
+            f"development set {_ENV_ALLOW_INSECURE_LOCALHOST}=1."
+        )
+    https_ok = parsed.scheme == "https" and bool(host)
+    localhost_http_ok = override and loopback and parsed.scheme == "http" and bool(host)
+    if not (https_ok or localhost_http_ok):
+        raise ValueError(
+            f"{field} must be https. A localhost-only dev override is "
+            f"{_ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for "
+            "loopback hosts (localhost, 127.0.0.0/8, ::1, and mapped loopback)."
         )
     return cleaned
 
@@ -346,32 +458,44 @@ class AgentShield:
 
     Args:
         tenant_id: The one hard-required field — identifies the tenant in the
-            multi-tenant plane. Must be a non-empty string. No env fallback:
-            tenant is call-site identity, not deployment config.
+            multi-tenant plane. Must be a non-empty, non-whitespace string.
+            No env fallback: tenant is call-site identity, not deployment config.
         pep_url: Base URL of the PEP gateway. Required: this argument OR
-            ``G8R_PEP_URL``. No ``console_url`` fallback. Loopback is refused.
-            wrap() hops ``POST {pep_url}/decide``.
+            ``G8R_PEP_URL``. No ``console_url`` fallback. Must be ``https``.
+            Loopback is refused unless ``G8R_ALLOW_INSECURE_LOCALHOST=1``,
+            which permits http only for loopback hosts (localhost and
+            ``*.localhost``, ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``,
+            and IPv4-mapped loopback). wrap() hops ``POST {pep_url}/decide``.
         console_url: Base URL of your deployed G8R Console (audit ``/log`` and
             the ``check()`` gap). Required in effect, but resolved from this
             argument OR the ``G8R_CONSOLE_URL`` env var; construction fails if
-            neither is set. Never defaults to localhost.
-        api_key: Bearer token for the SDK check/log endpoints — the STATIC
-            credential path (deployment shared secret). Required in effect
-            unless ``credential_provider`` is supplied; resolved from this
-            argument OR the ``G8R_API_KEY`` env var; construction fails if
-            neither yields a non-empty value. Mutually exclusive with
+            neither is set. Same https and loopback rules as ``pep_url``.
+            Never defaults to localhost.
+        api_key: This client's tenant or agent bearer credential, already
+            fetched at runtime by the caller. There is no default. Mutually
+            exclusive with ``credential_file``, ``credential_env``, and
             ``credential_provider``.
+        credential_file: Filesystem path of this client's tenant or agent
+            credential (for example a file written by 1Password or the broker).
+            Read at construction — missing or empty refuses to start — and
+            again on every request so a replaced file is picked up. The
+            contents are never logged.
+        credential_env: Name of the environment variable holding THIS client's
+            credential. The SDK does not choose a process-wide name; unset or
+            empty refuses to start. The value is never logged.
         credential_provider: Zero-argument callable returning the Bearer
-            credential — the DYNAMIC path for short-lived tokens (e.g. an
-            OIDC JWT minted via AWS workload identity). Invoked fresh for
-            EVERY request (both ``/check`` and ``/log``) so a token that
-            expires mid-session never goes stale inside a long-lived
-            AgentShield instance. Mutually exclusive with an explicit
-            ``api_key`` (``ValueError`` if both are passed); when supplied,
-            the ``G8R_API_KEY`` env var is ignored. Provider failures raise
-            ``ShieldConnectionError`` on the check path — fail closed, the
-            wrapped LLM call never executes. The returned value is never
-            logged.
+            credential — the dynamic path for short-lived per-tenant tokens
+            (for example an OIDC JWT). Invoked fresh for EVERY request (both
+            ``/check`` and ``/log``) so a token that expires mid-session never
+            goes stale. Mutually exclusive with the static sources above.
+            Provider failures raise ``ShieldConnectionError`` on the check
+            path — fail closed, the wrapped LLM call never executes. The
+            provider exception is not chained, so a token in its message
+            cannot leak through a traceback. The returned value is never
+            logged. When no explicit source is passed,
+            ``G8R_TENANT_CREDENTIAL`` or ``G8R_TENANT_CREDENTIAL_FILE`` (exactly
+            one) supplies the credential for this process. Construction fails
+            if none of these yields a credential.
         department: Functional department (e.g. 'Legal', 'Finance').
         user_id: Identifier of the end-user initiating the action.
         employee_name: Human-readable name for audit trail.
@@ -397,6 +521,8 @@ class AgentShield:
         "_pep_url",
         "_console_url",
         "_api_key",
+        "_credential_file",
+        "_credential_env",
         "_credential_provider",
         "_tenant_id",
         "_department",
@@ -417,6 +543,8 @@ class AgentShield:
         pep_url: str | None = None,
         console_url: str | None = None,
         api_key: str | None = None,
+        credential_file: str | None = None,
+        credential_env: str | None = None,
         department: str = "General",
         user_id: str = "unknown",
         employee_name: str | None = None,
@@ -433,7 +561,7 @@ class AgentShield:
                 "g8r-shield requires 'requests'. Install it with: pip install requests"
             )
 
-        if not tenant_id:
+        if not tenant_id or not tenant_id.strip():
             raise ValueError("tenant_id is required")
 
         resolved_url = console_url or os.environ.get(_ENV_CONSOLE_URL)
@@ -444,7 +572,7 @@ class AgentShield:
                 "a misconfigured agent would silently exfiltrate to whatever happens to be bound on "
                 "127.0.0.1 in the runtime environment."
             )
-        self._console_url = resolved_url.strip().rstrip("/")
+        self._console_url = _reject_loopback(resolved_url, "console_url")
 
         resolved_pep = pep_url or os.environ.get(_ENV_PEP_URL)
         if not resolved_pep:
@@ -454,27 +582,66 @@ class AgentShield:
             )
         self._pep_url = _reject_loopback(resolved_pep, "pep_url")
 
-        if credential_provider is not None and api_key is not None:
+        explicit_key = _nonempty(api_key)
+        explicit_file = _nonempty(credential_file)
+        explicit_env = _nonempty(credential_env)
+        sources = [
+            name
+            for name, present in (
+                ("api_key", explicit_key is not None),
+                ("credential_file", explicit_file is not None),
+                ("credential_env", explicit_env is not None),
+                ("credential_provider", credential_provider is not None),
+            )
+            if present
+        ]
+        if len(sources) > 1:
             # Two explicit credential sources is a config bug, not a
             # preference to guess at. Fail fast rather than silently
-            # picking one and leaving the other dead.
+            # picking one and leaving the other dead. The message names
+            # the sources only — never a credential value.
             raise ValueError(
-                "api_key and credential_provider are mutually exclusive. "
-                "Pass the static shared secret OR a provider callable, not both."
+                "api_key, credential_file, credential_env, and credential_provider "
+                "are mutually exclusive. Pass exactly one credential source."
             )
+
         self._credential_provider = credential_provider
+        self._credential_file = None
+        self._credential_env = None
+        self._api_key = ""
         if credential_provider is not None:
-            # Dynamic path: the provider is the sole credential source. The
-            # G8R_API_KEY env var is deliberately NOT consulted — a stale
-            # secret left in the deployment environment must never shadow
-            # the short-lived tokens the caller opted into.
-            self._api_key = ""
+            # Dynamic path: the provider is the sole credential source.
+            # Process env is not consulted — a stale value left in the
+            # environment must never shadow the token the caller opted into.
+            pass
+        elif explicit_key is not None:
+            self._api_key = explicit_key
+        elif explicit_file is not None:
+            _read_credential_file(explicit_file)  # refuse to start if unusable
+            self._credential_file = explicit_file
+        elif explicit_env is not None:
+            _read_credential_env(explicit_env)
+            self._credential_env = explicit_env
         else:
-            self._api_key = api_key or os.environ.get("G8R_API_KEY") or ""
-            if not self._api_key:
+            file_env = _nonempty(os.environ.get(_ENV_TENANT_CREDENTIAL_FILE))
+            value_env = _nonempty(os.environ.get(_ENV_TENANT_CREDENTIAL))
+            if file_env and value_env:
                 raise ValueError(
-                    "G8R API key is required. Pass api_key=... or set the G8R_API_KEY env var."
+                    "G8R_TENANT_CREDENTIAL and G8R_TENANT_CREDENTIAL_FILE are both set. "
+                    "Pass one per-tenant credential source. "
+                    "There is no shared or default SDK secret."
                 )
+            if file_env:
+                _read_credential_file(file_env)
+                self._credential_file = file_env
+            elif value_env:
+                # G8R_TENANT_CREDENTIAL is a fixed process variable, not a
+                # caller-named credential_env. Store the variable name and
+                # re-read it on every request; the secret is never copied
+                # onto the instance.
+                self._credential_env = _ENV_TENANT_CREDENTIAL
+            else:
+                raise ValueError(_MISSING_CREDENTIAL)
 
         self._tenant_id = tenant_id
         self._department = department
@@ -767,33 +934,53 @@ class AgentShield:
     def _bearer_credential(self) -> str:
         """Resolve the Bearer value for ONE outbound request.
 
-        Static path: the api_key resolved at construction. Dynamic path: the
-        credential_provider is invoked fresh on every call — never cached —
-        so short-lived tokens (OIDC JWTs from AWS workload identity) stay
-        valid across a long-lived AgentShield instance.
+        Static api_key: the value stored at construction. File and env
+        sources are read fresh on every call so a broker can rotate the
+        mounted credential without restarting the process. A provider is
+        invoked fresh on every call — never cached — so short-lived tokens
+        stay valid across a long-lived AgentShield instance.
 
-        A provider failure is wrapped in :class:`ShieldConnectionError`
+        A resolution failure is wrapped in :class:`ShieldConnectionError`
         rather than surfaced raw: like a connection failure, the request
         never completed and there is no server response to carry — and on
         the check path the caller fails CLOSED (the wrapped LLM call never
-        runs) instead of proceeding unevaluated. The provider's exception is
-        chained as ``__cause__``; its message is deliberately kept out of
-        ours, and the returned credential is never logged.
+        runs) instead of proceeding unevaluated. The original exception is
+        not chained (``from None``) for every credential source: a provider
+        message can contain the credential, and a file or env failure can
+        contain the path or the variable name. Traceback printers emit
+        ``__cause__`` and ``__context__``. The credential itself is never
+        logged.
         """
-        if self._credential_provider is None:
-            return self._api_key
         try:
-            return self._credential_provider()
-        except Exception as exc:
+            if self._credential_provider is not None:
+                credential = self._credential_provider()
+            elif self._credential_file is not None:
+                credential = _read_credential_file(self._credential_file)
+            elif self._credential_env is not None:
+                credential = _read_credential_env(self._credential_env)
+            else:
+                credential = self._api_key
+        except Exception:
+            if self._credential_provider is not None:
+                raise ShieldConnectionError(
+                    "[G8R Shield] credential_provider raised while resolving the "
+                    "Bearer credential; failing closed."
+                ) from None
             raise ShieldConnectionError(
-                "[G8R Shield] credential_provider raised while resolving the "
-                "Bearer credential; failing closed. See __cause__ for the "
-                "underlying error."
-            ) from exc
+                "[G8R Shield] The per-tenant credential could not be read; failing closed."
+            ) from None
+        if not isinstance(credential, str) or not credential.strip():
+            raise ShieldConnectionError(
+                "[G8R Shield] The per-tenant credential is empty; failing closed."
+            )
+        return credential.strip()
 
     def _prepare_receipt_request(
-        self, endpoint: str, payload: dict[str, Any],
-        headers: dict[str, str | bytes], request_id: str,
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        headers: dict[str, str | bytes],
+        request_id: str,
     ) -> dict[str, Any] | None:
         if self._receipt_verifier is None:
             return None
@@ -802,30 +989,44 @@ class AgentShield:
             for name, value in headers.items()
         }
         request = build_receipt_request(
-            endpoint=endpoint, tenant_id=self._tenant_id, agent_id=self._agent_id,
-            request_id=request_id, headers=wire_headers, body=payload,
+            endpoint=endpoint,
+            tenant_id=self._tenant_id,
+            agent_id=self._agent_id,
+            request_id=request_id,
+            headers=wire_headers,
+            body=payload,
         )
         headers["X-G8R-Receipt-Nonce"] = request["nonce"]
         headers["X-G8R-Receipt-Version"] = "1"
         return request
 
     def _verified_policy_decision(
-        self, data: Any, request: dict[str, Any], tokens: list[str],
+        self,
+        data: Any,
+        request: dict[str, Any],
+        tokens: list[str],
     ) -> PolicyDecision:
         if self._receipt_verifier is None:
             raise ReceiptVerificationError("Receipt verifier is required")
         receipt = self._receipt_verifier.verify_response(data, request)
         decision = receipt.decision
         return PolicyDecision(
-            decision=decision["decision"], reason=decision["reason"],
+            decision=decision["decision"],
+            reason=decision["reason"],
             violated_rule=decision["violatedRule"],
             requires_approval=decision["requiresApproval"],
             session_revoked=decision["sessionRevoked"],
-            compliance_mappings=[ComplianceMapping(
-                regulation=m["regulation"], control_id=m["controlId"],
-                control_name=m["controlName"], description=m["description"],
-            ) for m in decision["complianceMappings"]],
-            redacted_tokens=tokens, decision_receipt=receipt.token,
+            compliance_mappings=[
+                ComplianceMapping(
+                    regulation=m["regulation"],
+                    control_id=m["controlId"],
+                    control_name=m["controlName"],
+                    description=m["description"],
+                )
+                for m in decision["complianceMappings"]
+            ],
+            redacted_tokens=tokens,
+            decision_receipt=receipt.token,
         )
 
     def _evaluate(self, prompt: str, request_id: str | None = None) -> PolicyDecision:
@@ -879,7 +1080,10 @@ class AgentShield:
         # responses, including 401/403) are surfaced immediately — retrying
         # those is just doubling the user-visible latency.
         receipt_request = self._prepare_receipt_request(
-            "/api/sdk/v1/check", payload, headers, request_id,
+            "/api/sdk/v1/check",
+            payload,
+            headers,
+            request_id,
         )
         response = None
         last_exc: Exception | None = None
@@ -978,7 +1182,10 @@ class AgentShield:
         }
 
         receipt_request = self._prepare_receipt_request(
-            "/decide", payload, headers, request_id,
+            "/decide",
+            payload,
+            headers,
+            request_id,
         )
         response = None
         last_exc: Exception | None = None

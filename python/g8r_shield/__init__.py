@@ -11,7 +11,7 @@ Usage:
         tenant_id="demo-tenant",
         pep_url="https://pep.yourcompany.com",
         console_url="https://shield.yourcompany.com",
-        api_key="sk-shield-your-key",
+        credential_file="/run/secrets/g8r-tenant-credential",
         department="Legal",
         user_id="usr_001",
         ai_model="anthropic.claude-3-5-sonnet-20241022-v2:0",

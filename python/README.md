@@ -33,7 +33,7 @@ shield = AgentShield(
     tenant_id="acme-corp",
     pep_url="https://pep.yourcompany.com",       # or G8R_PEP_URL — required, no localhost
     console_url="https://shield.yourcompany.com",  # audit /log + check() gap
-    api_key="sk-shield-...",
+    credential_file="/run/secrets/g8r-tenant-credential",
     department="Finance",
     user_id="usr_FIN_042",
     employee_name="Dana Whitfield",
@@ -55,7 +55,7 @@ except ShieldBlockedError as err:
         print(f"  {m.regulation} {m.control_id} — {m.control_name}")
 ```
 
-`pep_url` is required (`G8R_PEP_URL`); there is no `console_url` fallback and loopback is refused. `console_url` / `api_key` fall back to `G8R_CONSOLE_URL` / `G8R_API_KEY`. `check()` still POSTs Console `/api/sdk/v1/check` (the documented gap). `wrap()` does not.
+`pep_url` is required (`G8R_PEP_URL`); there is no `console_url` fallback. Both `pep_url` and `console_url` must be `https`. Loopback is refused unless `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for localhost, 127.0.0.1, and `[::1]`. `console_url` falls back to `G8R_CONSOLE_URL`. The bearer credential is per tenant or per agent (`api_key`, `credential_file`, `credential_env`, or `G8R_TENANT_CREDENTIAL` / `G8R_TENANT_CREDENTIAL_FILE`) — there is no shared or default secret, and a missing credential raises `ValueError`. `check()` still POSTs Console `/api/sdk/v1/check` (the documented gap). `wrap()` does not.
 
 ## How It Works
 
@@ -86,10 +86,12 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 
 | Parameter            | Type            | Required | Default                                     | Description                              |
 | -------------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
-| `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty |
-| `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback) |
-| `api_key`            | `str`           | Yes\*    | `G8R_API_KEY` env                           | Static Bearer credential (your deployment's shared secret). Pass directly or set `G8R_API_KEY`; a missing value raises `ValueError`. Mutually exclusive with `credential_provider` |
-| `credential_provider` | `Callable[[], str]` | No  | `None`                                      | Zero-argument callable returning the Bearer credential, invoked fresh for every request — for short-lived tokens such as OIDC JWTs. Mutually exclusive with an explicit `api_key` (`ValueError` if both are passed); when set, `G8R_API_KEY` is ignored. See [Short-lived credentials](#short-lived-credentials-oidc--aws-workload-identity) |
+| `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty or whitespace |
+| `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | HTTPS URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback). Loopback is refused unless `G8R_ALLOW_INSECURE_LOCALHOST=1` |
+| `api_key`            | `str \| None`   | One of\* | `None`                                      | This client's tenant or agent bearer credential, already fetched at runtime. No default. Mutually exclusive with the other credential sources |
+| `credential_file`    | `str \| None`   | One of\* | `None` (or `G8R_TENANT_CREDENTIAL_FILE`)    | Path to this client's credential file (1Password or broker mount). Read at start and on every request. Contents are never logged |
+| `credential_env`     | `str \| None`   | One of\* | `None`                                      | Name of the env var holding THIS client's credential. Unset or empty refuses to start. The value is never logged |
+| `credential_provider` | `Callable[[], str] \| None` | One of\* | `None`                               | Zero-argument callable returning the bearer credential, invoked fresh for every request — for short-lived per-tenant tokens such as OIDC JWTs. See [Short-lived credentials](#short-lived-credentials-oidc--aws-workload-identity) |
 | `department`         | `str`           | No       | `"General"`                                 | Department of the calling user           |
 | `user_id`            | `str`           | No       | `"unknown"`                                 | User identifier                          |
 | `employee_name`      | `str \| None`   | No       | `None` (falls back to `user_id` in logs)    | Display name for audit trail             |
@@ -100,7 +102,7 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 | `block_on_escalated` | `bool`          | No       | `False`                                     | When `True`, `wrap()` raises `ShieldBlockedError` on escalated decisions instead of proceeding with a warning (fail-closed) |
 | `receipt_verification` | `ReceiptVerificationConfig \| None` | No | `None` | When set, `wrap()` and `check()` require a signed receipt on `/decide` and `/api/sdk/v1/check`. HTTPS is required on both URLs. Escalated is not executable. Unsigned is the default. See [Signed decision receipts](#signed-decision-receipts-receipt_verification). |
 
-\* `console_url` and `api_key` may be supplied either as keyword arguments or via the `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables. If neither source provides a value, the constructor raises `ValueError`.
+\* Pass exactly one of `api_key`, `credential_file`, `credential_env`, or `credential_provider`. If none is passed, set exactly one of `G8R_TENANT_CREDENTIAL` (the credential) or `G8R_TENANT_CREDENTIAL_FILE` (a path). Otherwise the constructor raises `ValueError`. There is no shared or default SDK secret. `console_url` may come from `G8R_CONSOLE_URL`.
 
 ### Signed decision receipts (`receipt_verification`)
 
@@ -117,7 +119,7 @@ shield = AgentShield(
     tenant_id="acme-corp",
     pep_url="https://pep.yourcompany.com",
     console_url="https://shield.yourcompany.com",
-    api_key="sk-shield-...",
+    credential_file="/run/secrets/g8r-tenant-credential",
     receipt_verification=ReceiptVerificationConfig(
         issuer="https://pep.yourcompany.com",
         audience="g8r-sdk",
@@ -224,7 +226,7 @@ if decision.decision == "blocked":
 
 ## Short-lived credentials (OIDC / AWS workload identity)
 
-Consoles that verify OIDC JWTs (issuer, JWKS, and audience configured server-side) accept a workload-identity token in place of the static shared secret. Because those tokens expire, pass a `credential_provider` instead of `api_key` — the SDK invokes it fresh for **every** request (both `/check` and `/log`), so a token refreshed mid-session is picked up automatically:
+Consoles that verify OIDC JWTs (issuer, JWKS, and audience configured server-side) accept a workload-identity token as this client's per-tenant credential. Because those tokens expire, pass a `credential_provider` — the SDK invokes it fresh for **every** request (both `/check` and `/log`), so a token refreshed mid-session is picked up automatically. A `credential_file` is also re-read on every request, so replacing a broker-mounted file rotates the credential without a restart:
 
 ```python
 from g8r_shield import AgentShield
@@ -243,7 +245,7 @@ shield = AgentShield(
 )
 ```
 
-- `credential_provider` and an explicit `api_key` are mutually exclusive — passing both raises `ValueError`. When a provider is set, the `G8R_API_KEY` env var is ignored.
+- `api_key`, `credential_file`, `credential_env`, and `credential_provider` are mutually exclusive — passing more than one raises `ValueError`. An explicit source is not shadowed by `G8R_TENANT_CREDENTIAL` or `G8R_TENANT_CREDENTIAL_FILE`.
 - If the provider raises during the policy check, the SDK raises `ShieldConnectionError` and the wrapped LLM call **never executes** (fail closed). A provider failure on the audit-log leg is swallowed like any other logging failure (a logging outage never breaks the decision path). The provider's return value is never logged.
 - The Console verifies the JWT's tenant claim against the request's `tenant_id`; a mismatch is rejected with `403` (surfaced as `ShieldConsoleError`).
 
@@ -345,7 +347,7 @@ The SDK communicates with two endpoints on the Agent Shield Console:
 | `/api/sdk/v1/check` | POST   | Evaluate a prompt against the policy engine |
 | `/api/sdk/v1/log`   | POST   | Log an interaction to the audit trail       |
 
-Both require an `Authorization: Bearer <credential>` header, where the credential is either your deployment's shared secret (`api_key` / `G8R_API_KEY`) or a verified OIDC JWT supplied via `credential_provider`. A bad or missing credential returns `401`; a JWT whose tenant claim does not match the request's `tenant_id` returns `403` (the verified claim wins). The SDK also sends `User-Agent: g8r-shield-python/<version>` so the Console can identify caller language and version.
+Both require an `Authorization: Bearer <credential>` header. The credential is this client's tenant or agent credential (static value, file, env var, or a verified OIDC JWT from `credential_provider`). A bad or missing credential returns `401`; a JWT whose tenant claim does not match the request's `tenant_id` returns `403` (the verified claim wins). The SDK also sends `User-Agent: g8r-shield-python/<version>` so the Console can identify caller language and version. The credential is never logged.
 
 ## Requirements
 

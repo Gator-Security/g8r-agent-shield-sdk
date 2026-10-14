@@ -9,6 +9,11 @@ describe('tenantId', () => {
     expect(() => tenantId('')).toThrow(/empty/);
   });
 
+  it('rejects a whitespace-only tenant id', () => {
+    expect(() => tenantId('   ')).toThrow(/empty/);
+    expect(() => tenantId('\n\t')).toThrow(/empty/);
+  });
+
   it('rejects an out-of-charset slug', () => {
     expect(() => tenantId('Bad_Slug')).toThrow(/1-64 chars/);
   });
