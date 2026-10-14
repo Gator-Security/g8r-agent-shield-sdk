@@ -90,7 +90,6 @@ const ENV_TENANT_CREDENTIAL = 'G8R_TENANT_CREDENTIAL';
 const ENV_TENANT_CREDENTIAL_FILE = 'G8R_TENANT_CREDENTIAL_FILE';
 /** Local-dev only. Permits http to loopback hosts and nothing else. */
 const ENV_ALLOW_INSECURE_LOCALHOST = 'G8R_ALLOW_INSECURE_LOCALHOST';
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const PEP_DECIDE_PATH = '/decide';
 
 const MISSING_CREDENTIAL =
@@ -112,6 +111,103 @@ function localhostDevOverride(): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
+/**
+ * Parse an IPv4 dotted quad the way Python's ipaddress module does:
+ * four decimal octets, no leading zeros.
+ */
+function parseIpv4(text: string): number | null {
+  const parts = text.split('.');
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^(0|[1-9][0-9]{0,2})$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = (value * 256 + octet) >>> 0;
+  }
+  return value;
+}
+
+/** 127.0.0.0/8, or 0.0.0.0 which this SDK treats as loopback. */
+function ipv4IsLoopbackFamily(value: number): boolean {
+  if (value === 0) return true;
+  return (value >>> 24) === 127;
+}
+
+/** Eight hextets, or null when `text` is not an IPv6 address. */
+function parseIpv6Groups(text: string): number[] | null {
+  let body = text;
+  if (body.includes('.')) {
+    const lastColon = body.lastIndexOf(':');
+    if (lastColon < 0) return null;
+    const v4 = parseIpv4(body.slice(lastColon + 1));
+    if (v4 === null) return null;
+    const hi = (v4 >>> 16) & 0xffff;
+    const lo = v4 & 0xffff;
+    body = `${body.slice(0, lastColon + 1)}${hi.toString(16)}:${lo.toString(16)}`;
+  }
+  const halves = body.split('::');
+  if (halves.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (side === '') return [];
+    const groups = side.split(':');
+    const out: number[] = [];
+    for (const group of groups) {
+      if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+      out.push(parseInt(group, 16));
+    }
+    return out;
+  };
+  if (halves.length === 1) {
+    const groups = parseSide(halves[0]);
+    if (!groups || groups.length !== 8) return null;
+    return groups;
+  }
+  const left = parseSide(halves[0]);
+  const right = parseSide(halves[1]);
+  if (!left || !right) return null;
+  // `::` must compress at least one group.
+  if (left.length + right.length > 7) return null;
+  const missing = 8 - left.length - right.length;
+  return [...left, ...new Array<number>(missing).fill(0), ...right];
+}
+
+/**
+ * Loopback names and addresses. Same set as the Python SDK: localhost and
+ * `*.localhost` (a trailing DNS dot is ignored), 127.0.0.0/8, 0.0.0.0, ::,
+ * ::1, and any IPv4-mapped IPv6 address whose embedded IPv4 is one of those.
+ * Brackets and a zone id are stripped. Ports are not part of `host`.
+ */
+function isLoopbackHost(host: string): boolean {
+  let normalized = host.trim().toLowerCase();
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    normalized = normalized.slice(1, -1);
+  }
+  while (normalized.endsWith('.')) normalized = normalized.slice(0, -1);
+  const zone = normalized.indexOf('%');
+  if (zone !== -1) normalized = normalized.slice(0, zone);
+  if (!normalized) return false;
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) return true;
+  const v4 = parseIpv4(normalized);
+  if (v4 !== null) return ipv4IsLoopbackFamily(v4);
+  if (!normalized.includes(':')) return false;
+  const groups = parseIpv6Groups(normalized);
+  if (!groups) return false;
+  const mapped =
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff;
+  if (mapped) {
+    const embedded = ((groups[6] << 16) | groups[7]) >>> 0;
+    return ipv4IsLoopbackFamily(embedded);
+  }
+  if (groups.every((group) => group === 0)) return true;
+  return groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1;
+}
+
 function rejectLoopback(url: string, field: string): string {
   const cleaned = url.trim().replace(/\/+$/, '');
   if (!cleaned) {
@@ -124,7 +220,7 @@ function rejectLoopback(url: string, field: string): string {
     throw new Error(`${field} must be an https URL`);
   }
   const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const loopback = LOOPBACK_HOSTS.has(host);
+  const loopback = isLoopbackHost(host);
   const override = localhostDevOverride();
   if (loopback && !override) {
     throw new Error(
@@ -135,7 +231,7 @@ function rejectLoopback(url: string, field: string): string {
   const localhostHttpOk = override && loopback && parsed.protocol === 'http:' && host.length > 0;
   if (!httpsOk && !localhostHttpOk) {
     throw new Error(
-      `${field} must be https. A localhost-only dev override is ${ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for localhost, 127.0.0.1, and [::1].`
+      `${field} must be https. A localhost-only dev override is ${ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for loopback hosts (localhost, 127.0.0.0/8, ::1, and mapped loopback).`
     );
   }
   return cleaned;
@@ -160,8 +256,9 @@ export interface ShieldConfig {
   /**
    * Base URL of the PEP gateway. Required: this field OR `G8R_PEP_URL`.
    * No consoleUrl fallback. Must be https. Loopback is refused unless
-   * `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for localhost,
-   * 127.0.0.1, and [::1]. wrap() hops POST {pepUrl}/decide.
+   * `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for loopback
+   * hosts (localhost and `*.localhost`, 127.0.0.0/8, 0.0.0.0, ::, ::1, and
+   * IPv4-mapped loopback). wrap() hops POST {pepUrl}/decide.
    */
   pepUrl?: string;
   /**
@@ -206,9 +303,10 @@ export interface ShieldConfig {
    * (exactly one) supplies the credential for this process. The constructor
    * throws if none of these yields a credential. A provider rejection fails
    * CLOSED: it surfaces as ShieldConnectionError and wrap() never invokes the
-   * LLM factory. The provider rejection is not attached as `cause` — its
-   * message can contain the credential. The returned credential is used only
-   * for the Authorization header and is never logged.
+   * LLM factory. The rejection is not attached as `cause` — a provider
+   * message can contain the credential, and a file or env failure can name
+   * the path or variable. The returned credential is used only for the
+   * Authorization header and is never logged.
    */
   credentialProvider?: () => string | Promise<string>;
   /** Tenant this SDK instance operates on behalf of. Required; blank or whitespace is rejected. */
@@ -1025,10 +1123,11 @@ export class AgentShield {
         throw new Error('resolved credential is empty');
       }
       return credential;
-    } catch (err) {
-      // Log the failure class, never the credential and never the provider
-      // exception. A provider error can embed the token; attaching it as
-      // `cause` would print that token from console.error / inspect.
+    } catch {
+      // Log the failure class, never the credential and never the underlying
+      // error. A provider error can embed the token, and a file or env
+      // failure names the path or variable. Attaching either as `cause`
+      // would print it from console.error / inspect.
       log.error(
         this.credentialKind === 'provider'
           ? 'credential_provider_failed'
@@ -1040,8 +1139,7 @@ export class AgentShield {
           ? 'credentialProvider rejected — no request was sent to the console. ' +
             'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
           : 'The per-tenant credential could not be read. No request was sent.';
-      const cause = this.credentialKind === 'provider' ? undefined : err;
-      throw new ShieldConnectionError(this.consoleUrl, cause, `[G8R Shield] ${detail}`);
+      throw new ShieldConnectionError(this.consoleUrl, undefined, `[G8R Shield] ${detail}`);
     }
   }
 }
@@ -1121,8 +1219,9 @@ export class ShieldConsoleError extends Error {
  * leave the process without a credential, which is the same
  * "could not complete the exchange" failure mode — the `message` override
  * names the provider so operators aren't sent chasing a healthy console.
- * The provider rejection is not stored on `.cause`; it can contain the
- * credential, and Node prints that chain.
+ * A credential-resolution failure is not stored on `.cause`: a provider
+ * rejection can contain the credential, and a file or env failure can name
+ * the path or variable. Node prints that chain.
  */
 export class ShieldConnectionError extends Error {
   public readonly consoleUrl: string;

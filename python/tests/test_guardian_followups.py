@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 import threading
+import traceback
 from pathlib import Path
 
 import pytest
 import requests
 
-from g8r_shield import AgentShield
+from g8r_shield import AgentShield, ShieldConnectionError
 from g8r_shield.shield import requests as shield_requests
 
 from .conftest import CONSOLE_URL, PEP_URL
@@ -185,3 +186,144 @@ def test_concurrent_two_tenants_do_not_cross_credentials(
 
 def json_bytes(body: dict[str, object]) -> bytes:
     return json.dumps(body).encode("utf-8")
+
+
+# Hosts that must be treated as loopback: the whole 127.0.0.0/8, the
+# unspecified addresses, IPv6 loopback, any IPv4-mapped loopback (dotted or
+# hex), and localhost including a trailing dot and nested names. Ports,
+# brackets, and userinfo are part of the URL, not the host.
+_LOOPBACK_URLS = [
+    "https://127.0.0.0",
+    "https://127.0.0.1",
+    "https://127.0.0.2",
+    "https://127.255.255.255",
+    "http://127.0.0.2:9",
+    "https://user:secret@127.0.0.2",
+    "https://0.0.0.0",
+    "http://0.0.0.0:8080",
+    "https://[::]",
+    "http://[::]:8080",
+    "https://[::1]",
+    "http://[::1]:3000",
+    "https://[::ffff:127.0.0.1]",
+    "http://[::ffff:127.0.0.1]:8443",
+    "https://[::ffff:127.0.0.2]",
+    "https://[::FFFF:7f00:1]",
+    "https://localhost",
+    "http://localhost:3000",
+    "https://LOCALHOST",
+    "https://api.localhost",
+    "https://foo.bar.localhost",
+    "http://app.localhost:8080",
+    "https://localhost.",
+    "https://api.localhost.",
+]
+
+# Not loopback. https is allowed; http stays forbidden even with the override.
+_NON_LOOPBACK_HTTPS_URLS = [
+    "https://128.0.0.1",
+    "https://example.com",
+    "https://localhost.example.com",
+    "https://notlocalhost",
+    "https://example.localhost.com",
+    "https://[::2]",
+    "https://[::ffff:8.8.8.8]",
+    "https://8.8.8.8",
+]
+
+_NON_LOOPBACK_HTTP_URLS = [
+    "http://128.0.0.1",
+    "http://example.com",
+    "http://[::2]",
+    "http://[::ffff:8.8.8.8]",
+    "http://localhost.example.com",
+]
+
+# http is permitted for these only when the localhost dev override is on.
+_LOOPBACK_HTTP_URLS = [
+    "http://127.0.0.1:3000",
+    "http://127.0.0.2:9",
+    "http://0.0.0.0:8080",
+    "http://[::]:8080",
+    "http://[::1]:3000",
+    "http://[::ffff:127.0.0.1]:8443",
+    "http://[::ffff:7f00:2]",
+    "http://localhost:3000",
+    "http://api.localhost:8080",
+    "http://app.localhost.",
+]
+
+
+@pytest.mark.parametrize("source", ["file", "env"])
+def test_credential_read_error_is_generic_and_unchained(
+    source: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later file or env read failure must not chain the underlying error.
+
+    ``__cause__`` and the implicit context both print, and those messages
+    carry the path or the variable name. The surfaced message stays generic.
+    """
+    monkeypatch.delenv("G8R_TENANT_CREDENTIAL", raising=False)
+    monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
+    secret = "credential-value-do-not-leak"
+    if source == "file":
+        marker = "credential-path-do-not-leak"
+        path = tmp_path / marker
+        path.write_text(secret + "\n", encoding="utf-8")
+        client = _shield(api_key=None, credential_file=str(path))
+        path.unlink()
+        leaked = (marker, secret, str(path), "FileNotFoundError", "No such file")
+    else:
+        marker = "G8R_DO_NOT_LEAK_ENV_NAME"
+        monkeypatch.setenv(marker, secret)
+        client = _shield(api_key=None, credential_env=marker)
+        monkeypatch.delenv(marker)
+        leaked = (marker, secret, "unset or empty")
+
+    with pytest.raises(ShieldConnectionError) as exc_info:
+        client.check("ping", log=False)
+
+    err = exc_info.value
+    assert err.__cause__ is None
+    assert err.__suppress_context__ is True
+    message = str(err)
+    assert "could not be read" in message
+    assert "failing closed" in message
+    rendered = "".join(traceback.format_exception(err))
+    for needle in leaked:
+        assert needle not in message
+        assert needle not in rendered
+
+
+@pytest.mark.parametrize("url", _LOOPBACK_URLS)
+def test_loopback_url_is_rejected(url: str) -> None:
+    with pytest.raises(ValueError, match="must not target localhost"):
+        _shield(console_url=url)
+    with pytest.raises(ValueError, match="must not target localhost"):
+        _shield(pep_url=url)
+
+
+@pytest.mark.parametrize("url", _NON_LOOPBACK_HTTPS_URLS)
+def test_non_loopback_https_is_allowed(url: str) -> None:
+    client = _shield(console_url=url, pep_url=url)
+    assert client._console_url == url
+    assert client._pep_url == url
+
+
+@pytest.mark.parametrize("url", _NON_LOOPBACK_HTTP_URLS)
+def test_override_does_not_permit_non_loopback_http(
+    url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("G8R_ALLOW_INSECURE_LOCALHOST", "1")
+    with pytest.raises(ValueError, match="must be https"):
+        _shield(console_url=url)
+    with pytest.raises(ValueError, match="must be https"):
+        _shield(pep_url=url)
+
+
+@pytest.mark.parametrize("url", _LOOPBACK_HTTP_URLS)
+def test_override_permits_http_to_loopback(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("G8R_ALLOW_INSECURE_LOCALHOST", "1")
+    client = _shield(console_url=url, pep_url=url)
+    assert client._console_url == url
+    assert client._pep_url == url

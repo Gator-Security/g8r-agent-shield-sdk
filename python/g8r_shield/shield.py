@@ -4,6 +4,7 @@ Core AgentShield class — wraps the G8R Console REST API.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import time
 import uuid
@@ -60,7 +61,6 @@ _ENV_TENANT_CREDENTIAL = "G8R_TENANT_CREDENTIAL"
 _ENV_TENANT_CREDENTIAL_FILE = "G8R_TENANT_CREDENTIAL_FILE"
 # Local-dev only. Permits http to loopback hosts and nothing else.
 _ENV_ALLOW_INSECURE_LOCALHOST = "G8R_ALLOW_INSECURE_LOCALHOST"
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _DEV_OVERRIDE_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 _MISSING_CREDENTIAL = (
@@ -121,6 +121,39 @@ def _read_credential_env(name: str) -> str:
     return credential
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback names and addresses.
+
+    Covers ``localhost`` and ``*.localhost`` (a trailing DNS dot is ignored),
+    ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``, and any IPv4-mapped IPv6
+    address whose embedded IPv4 is one of those. Brackets and a zone id are
+    stripped. Ports are not part of ``host``; callers pass the URL hostname.
+    """
+    normalized = host.strip().lower()
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+    while normalized.endswith("."):
+        normalized = normalized[:-1]
+    zone = normalized.find("%")
+    if zone != -1:
+        normalized = normalized[:zone]
+    if not normalized:
+        return False
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        parsed = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    if isinstance(parsed, ipaddress.IPv6Address):
+        mapped = parsed.ipv4_mapped
+        if mapped is not None:
+            # Unwrap so 3.10–3.12 (where IPv6.is_loopback is only ::1) agree
+            # with 3.13+, which delegates mapped addresses to the IPv4 check.
+            parsed = mapped
+    return parsed.is_loopback or parsed.is_unspecified
+
+
 def _localhost_dev_override() -> bool:
     """True only for an explicit localhost dev override. Anything else is off."""
     raw = os.environ.get(_ENV_ALLOW_INSECURE_LOCALHOST)
@@ -134,8 +167,10 @@ def _reject_loopback(url: str, field: str) -> str:
 
     HTTPS is required. Loopback targets are refused so a misconfigured agent
     cannot ship prompts to 127.0.0.1. ``G8R_ALLOW_INSECURE_LOCALHOST=1``
-    permits ``http`` only for localhost, 127.0.0.1, and ``[::1]`` (https on
-    those hosts is allowed too). It does not permit plaintext to any other host.
+    permits ``http`` only for loopback hosts: localhost and ``*.localhost``,
+    ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``, and IPv4-mapped loopback
+    (https on those hosts is allowed too). It does not permit plaintext to
+    any other host.
     """
     cleaned = url.strip().rstrip("/")
     if not cleaned:
@@ -144,8 +179,8 @@ def _reject_loopback(url: str, field: str) -> str:
         parsed = urlsplit(cleaned)
     except ValueError:
         raise ValueError(f"{field} must be an https URL") from None
-    host = (parsed.hostname or "").lower()
-    loopback = host in _LOOPBACK_HOSTS
+    host = parsed.hostname or ""
+    loopback = _is_loopback_host(host)
     override = _localhost_dev_override()
     if loopback and not override:
         raise ValueError(
@@ -159,7 +194,7 @@ def _reject_loopback(url: str, field: str) -> str:
         raise ValueError(
             f"{field} must be https. A localhost-only dev override is "
             f"{_ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for "
-            "localhost, 127.0.0.1, and [::1]."
+            "loopback hosts (localhost, 127.0.0.0/8, ::1, and mapped loopback)."
         )
     return cleaned
 
@@ -428,8 +463,9 @@ class AgentShield:
         pep_url: Base URL of the PEP gateway. Required: this argument OR
             ``G8R_PEP_URL``. No ``console_url`` fallback. Must be ``https``.
             Loopback is refused unless ``G8R_ALLOW_INSECURE_LOCALHOST=1``,
-            which permits http only for localhost, 127.0.0.1, and ``[::1]``.
-            wrap() hops ``POST {pep_url}/decide``.
+            which permits http only for loopback hosts (localhost and
+            ``*.localhost``, ``127.0.0.0/8``, ``0.0.0.0``, ``::``, ``::1``,
+            and IPv4-mapped loopback). wrap() hops ``POST {pep_url}/decide``.
         console_url: Base URL of your deployed G8R Console (audit ``/log`` and
             the ``check()`` gap). Required in effect, but resolved from this
             argument OR the ``G8R_CONSOLE_URL`` env var; construction fails if
@@ -908,10 +944,12 @@ class AgentShield:
         rather than surfaced raw: like a connection failure, the request
         never completed and there is no server response to carry — and on
         the check path the caller fails CLOSED (the wrapped LLM call never
-        runs) instead of proceeding unevaluated. A ``credential_provider``
-        exception is not chained (``from None``): its message can contain
-        the credential, and traceback printers emit ``__cause__`` and
-        ``__context__``. The credential itself is never logged.
+        runs) instead of proceeding unevaluated. The original exception is
+        not chained (``from None``) for every credential source: a provider
+        message can contain the credential, and a file or env failure can
+        contain the path or the variable name. Traceback printers emit
+        ``__cause__`` and ``__context__``. The credential itself is never
+        logged.
         """
         try:
             if self._credential_provider is not None:
@@ -922,7 +960,7 @@ class AgentShield:
                 credential = _read_credential_env(self._credential_env)
             else:
                 credential = self._api_key
-        except Exception as exc:
+        except Exception:
             if self._credential_provider is not None:
                 raise ShieldConnectionError(
                     "[G8R Shield] credential_provider raised while resolving the "
@@ -930,7 +968,7 @@ class AgentShield:
                 ) from None
             raise ShieldConnectionError(
                 "[G8R Shield] The per-tenant credential could not be read; failing closed."
-            ) from exc
+            ) from None
         if not isinstance(credential, str) or not credential.strip():
             raise ShieldConnectionError(
                 "[G8R Shield] The per-tenant credential is empty; failing closed."

@@ -162,6 +162,140 @@ describe('guardian follow-ups', () => {
     }
   });
 
+  it.each(['file', 'env'] as const)(
+    'does not chain a %s credential read error or include its details',
+    async (source) => {
+      const secret = 'credential-value-do-not-leak';
+      const scratch = mkdtempSync(join(tmpdir(), 'g8r-cred-leak-'));
+      const pathMarker = 'credential-path-do-not-leak';
+      const envName = 'G8R_DO_NOT_LEAK_ENV_NAME';
+      try {
+        let client: AgentShield;
+        if (source === 'file') {
+          const credFile = join(scratch, pathMarker);
+          writeFileSync(credFile, `${secret}\n`, 'utf8');
+          client = shield({ apiKey: undefined, credentialFile: credFile });
+          rmSync(credFile);
+        } else {
+          process.env[envName] = secret;
+          client = shield({ apiKey: undefined, credentialEnv: envName });
+          delete process.env[envName];
+        }
+
+        let thrown: ShieldConnectionError | undefined;
+        try {
+          await client.check('ping', { log: false });
+        } catch (err) {
+          thrown = err as ShieldConnectionError;
+        }
+
+        expect(thrown).toBeInstanceOf(ShieldConnectionError);
+        expect(thrown!.cause).toBeUndefined();
+        const message = thrown!.message;
+        expect(message).toContain('could not be read');
+        expect(message).toContain('No request was sent');
+        const rendered = `${message}\n${inspect(thrown)}`;
+        const needles =
+          source === 'file'
+            ? [secret, pathMarker, 'ENOENT', 'could not be read (']
+            : [secret, envName, 'unset or empty'];
+        for (const needle of needles) {
+          expect(rendered).not.toContain(needle);
+        }
+      } finally {
+        delete process.env[envName];
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    }
+  );
+
+  // Whole 127.0.0.0/8, unspecified addresses, IPv6 loopback, any IPv4-mapped
+  // loopback, and localhost (including nested names and a trailing dot).
+  // Brackets and ports stay in the URL and must not defeat the check.
+  const loopbackUrls = [
+    'https://127.0.0.0',
+    'https://127.0.0.1',
+    'https://127.0.0.2',
+    'https://127.255.255.255',
+    'http://127.0.0.2:9',
+    'https://user:secret@127.0.0.2',
+    'https://0.0.0.0',
+    'http://0.0.0.0:8080',
+    'https://[::]',
+    'http://[::]:8080',
+    'https://[::1]',
+    'http://[::1]:3000',
+    'https://[::ffff:127.0.0.1]',
+    'http://[::ffff:127.0.0.1]:8443',
+    'https://[::ffff:127.0.0.2]',
+    'https://[::FFFF:7f00:1]',
+    'https://localhost',
+    'http://localhost:3000',
+    'https://LOCALHOST',
+    'https://api.localhost',
+    'https://foo.bar.localhost',
+    'http://app.localhost:8080',
+    'https://localhost.',
+    'https://api.localhost.',
+  ];
+
+  const nonLoopbackHttpsUrls = [
+    'https://128.0.0.1',
+    'https://example.com',
+    'https://localhost.example.com',
+    'https://notlocalhost',
+    'https://example.localhost.com',
+    'https://[::2]',
+    'https://[::ffff:8.8.8.8]',
+    'https://8.8.8.8',
+  ];
+
+  const nonLoopbackHttpUrls = [
+    'http://128.0.0.1',
+    'http://example.com',
+    'http://[::2]',
+    'http://[::ffff:8.8.8.8]',
+    'http://localhost.example.com',
+  ];
+
+  const loopbackHttpUrls = [
+    'http://127.0.0.1:3000',
+    'http://127.0.0.2:9',
+    'http://0.0.0.0:8080',
+    'http://[::]:8080',
+    'http://[::1]:3000',
+    'http://[::ffff:127.0.0.1]:8443',
+    'http://[::ffff:7f00:2]',
+    'http://localhost:3000',
+    'http://api.localhost:8080',
+    'http://app.localhost.',
+  ];
+
+  it.each(loopbackUrls)('rejects loopback target %s', (url) => {
+    expect(() => shield({ consoleUrl: url })).toThrow(/must not target localhost/);
+    expect(() => shield({ pepUrl: url })).toThrow(/must not target localhost/);
+  });
+
+  it.each(nonLoopbackHttpsUrls)('allows non-loopback https %s', (url) => {
+    const client = shield({ consoleUrl: url, pepUrl: url });
+    expect(client.toString()).toContain(url);
+  });
+
+  it.each(nonLoopbackHttpUrls)(
+    'override does not permit non-loopback http %s',
+    (url) => {
+      process.env.G8R_ALLOW_INSECURE_LOCALHOST = '1';
+      expect(() => shield({ consoleUrl: url })).toThrow(/must be https/);
+      expect(() => shield({ pepUrl: url })).toThrow(/must be https/);
+    }
+  );
+
+  it.each(loopbackHttpUrls)('override permits http to loopback %s', (url) => {
+    process.env.G8R_ALLOW_INSECURE_LOCALHOST = '1';
+    const client = shield({ consoleUrl: url, pepUrl: url });
+    expect(client.toString()).toContain(url);
+  });
+
   it('browser and edge bundles do not statically import node:fs', async () => {
     // node:crypto and node:util stay external: they are a pre-existing
     // receipt import, not this follow-up. node:fs must not need that
