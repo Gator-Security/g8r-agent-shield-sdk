@@ -10,12 +10,13 @@
  *   import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
  *
  *   const shield = new AgentShield({
- *     // consoleUrl / apiKey can be omitted and resolved from the
- *     // G8R_CONSOLE_URL / G8R_API_KEY environment variables instead.
+ *     // consoleUrl can be omitted and resolved from G8R_CONSOLE_URL.
+ *     // The credential is per tenant or per agent, supplied at runtime.
+ *     // There is no shared or default secret.
  *     consoleUrl: 'https://shield.yourcompany.com',
- *     apiKey: 'sk-shield-...',
- *     // — or, for short-lived OIDC workload-identity JWTs, a provider that is
- *     // awaited fresh on every request (mutually exclusive with apiKey):
+ *     credentialFile: '/run/secrets/g8r-tenant-credential', // 1Password/broker mount
+ *     // — or credentialEnv: 'TENANT_ACME_CREDENTIAL',
+ *     // — or, for a short-lived token, a provider awaited fresh every request:
  *     // credentialProvider: () => mintWorkloadJwt(),
  *     tenantId: tenantId('acme-corp'),
  *     department: 'Finance',   // optional — defaults to 'General'
@@ -32,6 +33,8 @@
  *     'Summarize Q1 earnings'
  *   );
  */
+
+import { readFileSync } from 'node:fs';
 
 import { match } from 'ts-pattern';
 import { newRequestId, newSessionId, type RequestId, type TenantId } from './ids';
@@ -83,9 +86,17 @@ const RETRY_BACKOFF_MS = 500;
 
 /** Environment variable fallbacks for deployment config (12-factor). */
 const ENV_CONSOLE_URL = 'G8R_CONSOLE_URL';
-const ENV_API_KEY = 'G8R_API_KEY';
 const ENV_PEP_URL = 'G8R_PEP_URL';
+/** Runtime supply for ONE tenant or agent in this process. Not a shared default. */
+const ENV_TENANT_CREDENTIAL = 'G8R_TENANT_CREDENTIAL';
+const ENV_TENANT_CREDENTIAL_FILE = 'G8R_TENANT_CREDENTIAL_FILE';
 const PEP_DECIDE_PATH = '/decide';
+
+const MISSING_CREDENTIAL =
+  'A per-tenant credential is required. Pass apiKey, credentialFile, or ' +
+  'credentialEnv for this tenant or agent, or set G8R_TENANT_CREDENTIAL or ' +
+  'G8R_TENANT_CREDENTIAL_FILE to a credential fetched at runtime (for example ' +
+  'from 1Password or the broker). There is no shared or default SDK secret.';
 
 const OUTCOME_TO_DECISION: Record<string, PolicyCheckResult['decision']> = {
   ALLOW: 'allowed',
@@ -143,32 +154,41 @@ export interface ShieldConfig {
    */
   consoleUrl?: string;
   /**
-   * Static bearer credential for /api/sdk/v1/check and /log — the deployment
-   * shared secret the customer configured server-side. Optional at the type
-   * level, but effectively required unless `credentialProvider` is set:
-   * resolved from this field OR the `G8R_API_KEY` env var. If neither yields
-   * a non-empty value (and no provider is configured) the constructor throws.
-   * Never included in toString()/logs. Mutually exclusive with
-   * `credentialProvider`.
+   * This client's tenant or agent bearer credential, already fetched at
+   * runtime by the caller. There is no default. Never included in
+   * toString()/logs. Mutually exclusive with `credentialFile`,
+   * `credentialEnv`, and `credentialProvider`.
    */
   apiKey?: string;
   /**
+   * Filesystem path of this client's tenant or agent credential — for example
+   * a file written by 1Password or the broker. Read at construction (missing
+   * or empty refuses to start) and again on every request so a replaced file
+   * is picked up. The contents are never logged.
+   */
+  credentialFile?: string;
+  /**
+   * Name of the environment variable holding THIS client's credential. The
+   * SDK does not choose a process-wide name. Unset or empty refuses to start.
+   * The value is never logged.
+   */
+  credentialEnv?: string;
+  /**
    * Callback returning (or resolving to) the bearer credential for ONE
    * outbound request. Awaited fresh on EVERY /check and /log call, so
-   * short-lived credentials — e.g. OIDC workload-identity JWTs (AWS workload
-   * identity and friends) — never go stale inside a long-lived shield
-   * instance. The Console accepts either the deployment shared secret or a
-   * verified OIDC JWT in the same `Authorization: Bearer` header, so a static
-   * apiKey and a provider speak the identical wire contract. With a verified
-   * JWT the server trusts the JWT's tenant claim over the body's tenantId — a
-   * mismatch is HTTP 403 (a bad/missing credential is 401).
+   * short-lived per-tenant credentials — e.g. OIDC workload-identity JWTs —
+   * never go stale inside a long-lived shield instance. A static credential
+   * and a provider speak the same `Authorization: Bearer` wire contract.
+   * With a verified JWT the server trusts the JWT's tenant claim over the
+   * body's tenantId — a mismatch is HTTP 403 (a bad/missing credential is 401).
    *
-   * Mutually exclusive with `apiKey` — the constructor throws if both are
-   * passed, and the `G8R_API_KEY` env fallback is not consulted when a
-   * provider is configured. A provider rejection fails CLOSED: it surfaces as
-   * ShieldConnectionError and wrap() never invokes the LLM factory. The
-   * returned credential is used only for the Authorization header and is
-   * never logged.
+   * Mutually exclusive with the static sources above. When no explicit source
+   * is passed, `G8R_TENANT_CREDENTIAL` or `G8R_TENANT_CREDENTIAL_FILE`
+   * (exactly one) supplies the credential for this process. The constructor
+   * throws if none of these yields a credential. A provider rejection fails
+   * CLOSED: it surfaces as ShieldConnectionError and wrap() never invokes the
+   * LLM factory. The returned credential is used only for the Authorization
+   * header and is never logged.
    */
   credentialProvider?: () => string | Promise<string>;
   /** Tenant this SDK instance operates on behalf of. The one hard-required field. */
@@ -292,6 +312,7 @@ export class AgentShield {
   private readonly pepUrl: string;
   private readonly consoleUrl: string;
   private readonly credential: () => string | Promise<string>;
+  private readonly credentialKind: 'provider' | 'static';
   private readonly tenantId: TenantId;
   private readonly department: string;
   private readonly userId: string;
@@ -327,33 +348,58 @@ export class AgentShield {
       );
     }
 
-    // A static key and a per-request provider are two mutually exclusive
-    // answers to "where does the bearer credential come from". Refuse the
-    // ambiguity outright — silently preferring one usually hides a config
-    // merge bug upstream.
-    if (config.apiKey && config.credentialProvider) {
+    // Each client has exactly one credential source. Refusing the ambiguity
+    // outright — silently preferring one usually hides a config merge bug.
+    // The error names the sources only, never a credential value.
+    const explicitKey = config.apiKey?.trim() ? config.apiKey.trim() : undefined;
+    const explicitFile = config.credentialFile?.trim() || undefined;
+    const explicitEnv = config.credentialEnv?.trim() || undefined;
+    const sources = [
+      explicitKey ? 'apiKey' : '',
+      explicitFile ? 'credentialFile' : '',
+      explicitEnv ? 'credentialEnv' : '',
+      config.credentialProvider ? 'credentialProvider' : '',
+    ].filter((name) => name.length > 0);
+    if (sources.length > 1) {
       throw new Error(
-        'apiKey and credentialProvider are mutually exclusive. Pass exactly one credential source.'
+        'apiKey, credentialFile, credentialEnv, and credentialProvider are mutually exclusive. Pass exactly one credential source.'
       );
     }
 
-    // Resolve the credential SOURCE — never the credential itself: a provider
-    // is awaited per request (see resolveCredential()), not at construction.
-    // A static key is normalized into the same closure shape as a provider so
-    // /check and /log share one resolution path. When a provider is
-    // configured the G8R_API_KEY env fallback is deliberately not consulted —
-    // an explicit provider is an explicit choice of credential source.
+    // Resolve the credential SOURCE. A provider is awaited per request
+    // (see resolveCredential()). A file or named env var is re-read per
+    // request so a broker can rotate it. An explicit source wins over the
+    // process env; that env is not a shared default.
     let credential: () => string | Promise<string>;
+    let credentialKind: 'provider' | 'static' = 'static';
     if (config.credentialProvider) {
       credential = config.credentialProvider;
+      credentialKind = 'provider';
+    } else if (explicitKey) {
+      credential = () => explicitKey;
+    } else if (explicitFile) {
+      readCredentialFile(explicitFile);
+      credential = () => readCredentialFile(explicitFile);
+    } else if (explicitEnv) {
+      readCredentialEnv(explicitEnv);
+      credential = () => readCredentialEnv(explicitEnv);
     } else {
-      const resolvedKey = config.apiKey || readEnv(ENV_API_KEY);
-      if (!resolvedKey) {
+      const fileEnv = readEnv(ENV_TENANT_CREDENTIAL_FILE)?.trim();
+      const valueEnv = readEnv(ENV_TENANT_CREDENTIAL)?.trim();
+      if (fileEnv && valueEnv) {
         throw new Error(
-          `apiKey is required. Pass apiKey, set the ${ENV_API_KEY} env var, or pass a credentialProvider.`
+          'G8R_TENANT_CREDENTIAL and G8R_TENANT_CREDENTIAL_FILE are both set. ' +
+            'Pass one per-tenant credential source. There is no shared or default SDK secret.'
         );
       }
-      credential = () => resolvedKey;
+      if (fileEnv) {
+        readCredentialFile(fileEnv);
+        credential = () => readCredentialFile(fileEnv);
+      } else if (valueEnv) {
+        credential = () => readCredentialEnv(ENV_TENANT_CREDENTIAL);
+      } else {
+        throw new Error(MISSING_CREDENTIAL);
+      }
     }
 
     // Store all fields (with defaults applied) as write-once instance state.
@@ -361,6 +407,7 @@ export class AgentShield {
     this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
     this.pepUrl = rejectLoopback(resolvedPep, 'pepUrl');
     this.credential = credential;
+    this.credentialKind = credentialKind;
     this.tenantId = config.tenantId;
     this.department = config.department ?? DEFAULT_DEPARTMENT;
     this.userId = config.userId ?? DEFAULT_USER_ID;
@@ -952,18 +999,27 @@ export class AgentShield {
    */
   private async resolveCredential(): Promise<string> {
     try {
-      return await this.credential();
+      const credential = (await this.credential()).trim();
+      if (!credential) {
+        throw new Error('resolved credential is empty');
+      }
+      return credential;
     } catch (err) {
       // Log the failure (never the credential — there is none to leak, and
-      // the provider's error is preserved on `.cause` rather than stringified
+      // the underlying error is preserved on `.cause` rather than stringified
       // into a log line that downstream pipelines might surface).
-      log.error('credential_provider_failed', { tenant_id: this.tenantId });
-      throw new ShieldConnectionError(
-        this.consoleUrl,
-        err,
-        '[G8R Shield] credentialProvider rejected — no request was sent to the console. ' +
-          'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
+      log.error(
+        this.credentialKind === 'provider'
+          ? 'credential_provider_failed'
+          : 'credential_resolution_failed',
+        { tenant_id: this.tenantId }
       );
+      const detail =
+        this.credentialKind === 'provider'
+          ? 'credentialProvider rejected — no request was sent to the console. ' +
+            'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
+          : 'The per-tenant credential could not be read. No request was sent.';
+      throw new ShieldConnectionError(this.consoleUrl, err, `[G8R Shield] ${detail}`);
     }
   }
 }
@@ -1062,6 +1118,40 @@ export class ShieldConnectionError extends Error {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
+
+/** Read a tenant/agent credential file. The contents are never logged. */
+function readCredentialFile(path: string): string {
+  let raw: string;
+  try {
+    raw = readFileSync(path, { encoding: 'utf8' });
+  } catch (err) {
+    const code =
+      err && typeof err === 'object' && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : 'Error';
+    throw new Error(
+      `credentialFile ${JSON.stringify(path)} could not be read (${code}). A per-tenant credential is required.`
+    );
+  }
+  const credential = raw.trim();
+  if (!credential) {
+    throw new Error(
+      `credentialFile ${JSON.stringify(path)} is empty. A per-tenant credential is required.`
+    );
+  }
+  return credential;
+}
+
+/** Read a tenant/agent credential from a named env var. The value is never logged. */
+function readCredentialEnv(name: string): string {
+  const credential = (readEnv(name) ?? '').trim();
+  if (!credential) {
+    throw new Error(
+      `Environment variable ${name} is unset or empty. A per-tenant credential is required.`
+    );
+  }
+  return credential;
+}
 
 /** Read an environment variable, tolerating environments without `process`. */
 function readEnv(name: string): string | undefined {

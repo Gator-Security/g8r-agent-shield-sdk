@@ -23,7 +23,7 @@ const shield = new AgentShield({
   tenantId: tenantId('acme-corp'),        // the only hard-required field
   pepUrl: 'https://pep.yourcompany.com',  // or G8R_PEP_URL — required, no localhost
   consoleUrl: 'https://shield.yourcompany.com', // or G8R_CONSOLE_URL (audit /log)
-  apiKey: 'sk-shield-...',                // or G8R_API_KEY env var
+  credentialFile: '/run/secrets/g8r-tenant-credential', // or credentialEnv / G8R_TENANT_CREDENTIAL
   agentId: 'enterprise-assistant',        // optional — defaults to 'sdk-client'
   department: 'Finance',                  // optional — defaults to 'General'
   userId: 'usr_FIN_042',                  // optional — defaults to 'unknown'
@@ -37,13 +37,16 @@ const result = await shield.wrap(
 );
 ```
 
-> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** identity field. `pepUrl` is **required-in-effect** (`G8R_PEP_URL`); wrap() hops `POST {pepUrl}/decide` with **no** `consoleUrl` fallback and loopback refused. `consoleUrl` / `apiKey` are required-in-effect for audit `/log` and the `check()` gap (`G8R_CONSOLE_URL` / `G8R_API_KEY`). The constructor **throws** rather than defaulting to localhost. The credential can alternatively come from a [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — mutually exclusive with `apiKey`. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default. `receiptVerification` is optional and **unset by default** (unsigned). See [Signed decision receipts](#signed-decision-receipts-receiptverification).
+> **`ShieldConfig` fields.** `tenantId` is the **only hard-required** identity field. `pepUrl` is **required-in-effect** (`G8R_PEP_URL`); wrap() hops `POST {pepUrl}/decide` with **no** `consoleUrl` fallback and loopback refused. `consoleUrl` is required-in-effect for audit `/log` and the `check()` gap (`G8R_CONSOLE_URL`). The constructor **throws** rather than defaulting to localhost. A per-tenant or per-agent credential is required: `apiKey`, `credentialFile`, `credentialEnv`, or [`credentialProvider`](#authenticating-with-short-lived-credentials-credentialprovider) — exactly one. If none is passed, set `G8R_TENANT_CREDENTIAL` or `G8R_TENANT_CREDENTIAL_FILE` (not both). There is no shared or default secret, and the value is never logged. Everything else is **optional with a default**: `department` (`"General"`), `userId` (`"unknown"`), `aiModel` (`"unknown"`), `agentId` (`"sdk-client"`), `employeeName` (falls back to `userId` in the audit log), `timeout` (`10` seconds), and `blockOnEscalated` (`false`). `sessionId` is optional with **no** default. `receiptVerification` is optional and **unset by default** (unsigned). See [Signed decision receipts](#signed-decision-receipts-receiptverification).
 
 ```typescript
-// Minimal — consoleUrl + apiKey from env, everything else defaulted:
+// Minimal — console URL and this tenant's credential from the environment:
 //   export G8R_CONSOLE_URL=https://shield.yourcompany.com
-//   export G8R_API_KEY=sk-shield-...
-const shield = new AgentShield({ tenantId: tenantId('acme-corp') });
+//   export G8R_TENANT_CREDENTIAL_FILE=/run/secrets/g8r-tenant-credential
+const shield = new AgentShield({
+  pepUrl: 'https://pep.yourcompany.com',
+  tenantId: tenantId('acme-corp'),
+});
 ```
 
 ### Signed decision receipts (`receiptVerification`)
@@ -70,7 +73,7 @@ const shield = new AgentShield({
   tenantId: tenantId('acme-corp'),
   pepUrl: 'https://pep.yourcompany.com',
   consoleUrl: 'https://shield.yourcompany.com',
-  apiKey: process.env.G8R_API_KEY,
+  credentialFile: '/run/secrets/g8r-tenant-credential',
   receiptVerification,
 });
 ```
@@ -79,7 +82,7 @@ Trusted keys are Ed25519 public keys in SPKI PEM form, indexed by key id. The pr
 
 ### Authenticating with short-lived credentials (`credentialProvider`)
 
-The Console accepts either the deployment **shared secret** or a **verified OIDC JWT** (workload identity — e.g. AWS) in the same `Authorization: Bearer` header. For JWTs — which expire — pass a `credentialProvider` instead of a static `apiKey`. The provider is awaited **fresh on every `/decide`, `/check`, and `/log` request**, so a rotated token is always picked up:
+A verified OIDC JWT (workload identity — e.g. AWS) is sent as this client's per-tenant credential in the `Authorization: Bearer` header. For JWTs — which expire — pass a `credentialProvider`. The provider is awaited **fresh on every `/decide`, `/check`, and `/log` request**, so a rotated token is always picked up. A `credentialFile` is re-read on every request too, so replacing a broker-mounted file rotates the credential without a restart:
 
 ```typescript
 const shield = new AgentShield({
@@ -90,7 +93,7 @@ const shield = new AgentShield({
 });
 ```
 
-- `apiKey` and `credentialProvider` are **mutually exclusive** — the constructor throws if both are passed, and the `G8R_API_KEY` env fallback is not consulted when a provider is configured.
+- `apiKey`, `credentialFile`, `credentialEnv`, and `credentialProvider` are **mutually exclusive** — the constructor throws if more than one is passed. An explicit source is not shadowed by `G8R_TENANT_CREDENTIAL` or `G8R_TENANT_CREDENTIAL_FILE`.
 - A provider **rejection on the policy check fails closed**: the SDK throws `ShieldConnectionError` (the provider's error is preserved on `.cause`), and `wrap()` never invokes the LLM factory. On the audit-log leg a provider failure is swallowed like any other logging failure — a logging outage never breaks the decision path (same contract as the Python SDK).
 - The resolved credential is used only for the `Authorization` header and is **never logged**.
 - With a verified JWT, the server trusts the JWT's **tenant claim** over the request body's `tenantId` — a mismatch returns HTTP `403`. A bad or missing credential returns `401`.

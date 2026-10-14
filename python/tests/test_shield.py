@@ -77,15 +77,16 @@ class TestConstruction:
 
     def test_console_url_env_fallback(self, monkeypatch):
         monkeypatch.setenv("G8R_CONSOLE_URL", "https://env.example.com/")
-        monkeypatch.setenv("G8R_API_KEY", "env-key")
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "env-key")
         s = AgentShield(tenant_id="t1", pep_url=PEP_URL)
         # Trailing slash should be stripped.
         assert s._console_url == "https://env.example.com"
-        assert s._api_key == "env-key"
+        assert s._bearer_credential() == "env-key"
 
     def test_explicit_args_override_env(self, monkeypatch):
         monkeypatch.setenv("G8R_CONSOLE_URL", "https://env.example.com")
-        monkeypatch.setenv("G8R_API_KEY", "env-key")
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "env-key")
         s = AgentShield(
             tenant_id="t1",
             pep_url=PEP_URL,
@@ -94,10 +95,12 @@ class TestConstruction:
         )
         assert s._console_url == "https://explicit.example.com"
         assert s._api_key == "explicit-key"
+        assert s._bearer_credential() == "explicit-key"
 
     def test_raises_when_no_api_key(self, monkeypatch):
-        monkeypatch.delenv("G8R_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="G8R API key is required"):
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL", raising=False)
+        monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
+        with pytest.raises(ValueError, match="per-tenant credential"):
             AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x")
 
     def test_raises_when_no_tenant_id(self):
@@ -132,7 +135,9 @@ class TestConstruction:
             AgentShield(tenant_id="t1", pep_url=PEP_URL, api_key="k")
 
     def test_timeout_accepts_float(self):
-        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k", timeout=2.5)
+        s = AgentShield(
+            tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k", timeout=2.5
+        )
         assert s._timeout == 2.5
 
     def test_slots_blocks_ad_hoc_attributes(self, shield):
@@ -144,6 +149,8 @@ class TestConstruction:
             "_pep_url",
             "_console_url",
             "_api_key",
+            "_credential_file",
+            "_credential_env",
             "_credential_provider",
             "_tenant_id",
             "_department",
@@ -640,7 +647,8 @@ class TestPayloadShape:
         """When employee_name is None, log payload uses user_id."""
 
         s = AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_999",
@@ -698,7 +706,8 @@ class TestPayloadShape:
     @responses.activate
     def test_check_payload_omits_employee_name_when_none(self):
         s = AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             api_key="sk-test",
             user_id="usr_x",
@@ -1001,7 +1010,8 @@ class TestCredentialProvider:
     @staticmethod
     def _provider_shield(provider) -> AgentShield:
         return AgentShield(
-            tenant_id="tenant-test", pep_url=PEP_URL,
+            tenant_id="tenant-test",
+            pep_url=PEP_URL,
             console_url=CONSOLE_URL,
             credential_provider=provider,
         )
@@ -1017,7 +1027,8 @@ class TestCredentialProvider:
         """Two explicit credential sources is a config bug — fail fast."""
         with pytest.raises(ValueError, match="mutually exclusive"):
             AgentShield(
-                tenant_id="t1", pep_url=PEP_URL,
+                tenant_id="t1",
+                pep_url=PEP_URL,
                 console_url=CONSOLE_URL,
                 api_key="sk-static",
                 credential_provider=lambda: "jwt-abc",
@@ -1028,6 +1039,7 @@ class TestCredentialProvider:
         """A stale G8R_API_KEY left in the deployment env must never shadow
         the provider the caller opted into."""
         monkeypatch.setenv("G8R_API_KEY", "stale-env-secret")
+        monkeypatch.setenv("G8R_TENANT_CREDENTIAL", "stale-env-secret")
         s = self._provider_shield(lambda: "jwt-abc")
         responses.add(responses.POST, CHECK_URL, json=allowed_response(), status=200)
 
@@ -1241,6 +1253,8 @@ class TestCanonicalContract:
             "pep_url",
             "console_url",
             "api_key",
+            "credential_file",
+            "credential_env",
             "department",
             "user_id",
             "employee_name",
@@ -1275,6 +1289,8 @@ class TestCanonicalContract:
         }
         assert defaults["console_url"] is None
         assert defaults["api_key"] is None
+        assert defaults["credential_file"] is None
+        assert defaults["credential_env"] is None
         assert defaults["department"] == "General"
         assert defaults["user_id"] == "unknown"
         assert defaults["employee_name"] is None
@@ -1355,7 +1371,8 @@ class TestCanonicalContract:
     def test_repr_never_exposes_api_key(self):
         """Contract: api_key must never appear in repr/str."""
         s = AgentShield(
-            tenant_id="t1", pep_url=PEP_URL,
+            tenant_id="t1",
+            pep_url=PEP_URL,
             console_url="https://c.example.com",
             api_key="sk-super-secret-abc123",
         )
@@ -1377,7 +1394,8 @@ class TestCanonicalContract:
 def _lineage_shield(agent_id: str = "test-agent", **kwargs) -> AgentShield:
     """Build a shield against the mock console with a given agent_id."""
     return AgentShield(
-        tenant_id="tenant-test", pep_url=PEP_URL,
+        tenant_id="tenant-test",
+        pep_url=PEP_URL,
         console_url=CONSOLE_URL,
         api_key="sk-shield-test-key",
         agent_id=agent_id,

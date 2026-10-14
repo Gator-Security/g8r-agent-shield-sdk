@@ -12,11 +12,12 @@ This repository holds two SDKs with an aligned wire contract and semantics:
 | Python     | [`python/`](./python)    | `g8r-shield` (PyPI)              |
 
 > **Note:** The TS/Python constructor surfaces are aligned — `tenantId` is the
-> only hard-required field in both; `consoleUrl` / `apiKey` resolve from the
-> `G8R_CONSOLE_URL` / `G8R_API_KEY` environment variables when not passed
-> directly; everything else defaults. The wire contract and pipeline semantics
-> are likewise aligned, and v2 Console support (workload-identity credentials,
-> agent registration) lands in both SDKs together.
+> only hard-required identity field in both. `consoleUrl` resolves from
+> `G8R_CONSOLE_URL` when not passed directly. The bearer credential is
+> per tenant or per agent, supplied at runtime (`apiKey` / `credentialFile` /
+> `credentialEnv`, or `G8R_TENANT_CREDENTIAL` / `G8R_TENANT_CREDENTIAL_FILE`).
+> There is no shared or default SDK secret. The client refuses to start
+> without a credential, and it never logs the value.
 
 ## What it does
 
@@ -40,7 +41,7 @@ import { AgentShield, tenantId } from '@g8r-security/agent-shield-sdk';
 const shield = new AgentShield({
   pepUrl: 'https://pep.yourcompany.com',
   consoleUrl: 'https://shield.yourcompany.com',
-  apiKey: 'sk-shield-...',
+  credentialFile: '/run/secrets/g8r-tenant-credential',
   tenantId: tenantId('your-tenant'),
   department: 'Finance',
   userId: 'usr_001',
@@ -64,7 +65,7 @@ shield = AgentShield(
     tenant_id="your-tenant",
     pep_url="https://pep.yourcompany.com",
     console_url="https://shield.yourcompany.com",
-    api_key="sk-shield-...",
+    credential_file="/run/secrets/g8r-tenant-credential",
 )
 
 result = shield.wrap(lambda: call_your_llm(prompt), prompt)
@@ -77,8 +78,29 @@ Full Python API: [`python/README.md`](./python/README.md).
 v0.5.0 `wrap()` hops PEP `POST /decide` (`pepUrl` / `G8R_PEP_URL` required; no
 console fallback, no localhost). `check()` still POSTs Console
 `/api/sdk/v1/check` (the documented gap). `/log` remains the audit adjunct.
-What v2 adds is a second way to authenticate that credential, plus first-class
-agent registration.
+What v2 adds is workload-identity authentication for that credential, plus
+first-class agent registration.
+
+### Per-tenant credential
+
+Each `AgentShield` client presents its own tenant or agent credential. The
+SDK will not start with a missing credential, and it will not fall back to a
+deployment-wide or hard-coded secret. Supply the credential at runtime, for
+example a file fetched from 1Password or the broker:
+
+- **File** — `credentialFile` / `credential_file`, or
+  `G8R_TENANT_CREDENTIAL_FILE` when this process serves one tenant.
+- **Env var** — `credentialEnv` / `credential_env` naming the variable that
+  holds this client's credential, or `G8R_TENANT_CREDENTIAL` for the
+  one-tenant process case.
+- **Already fetched** — pass `apiKey` / `api_key` for this client only.
+- **Short-lived token** — `credentialProvider` / `credential_provider`,
+  awaited fresh on every request.
+
+Two clients in one process pass different files or env var names; they do not
+share a credential. The value is sent only as `Authorization: Bearer` and is
+never logged. See the [TypeScript](./js/README.md) and
+[Python](./python/README.md) READMEs.
 
 ### Console-side configuration
 
@@ -86,29 +108,16 @@ Set these in your Console deployment's server-side environment:
 
 | Variable                    | Purpose                                                            |
 | --------------------------- | ------------------------------------------------------------------ |
-| `GF_SDK_SHARED_SECRET`      | Deployment shared secret — SDK calls presenting this value as the bearer credential are accepted |
 | `GF_SDK_OIDC_ISSUER`        | OIDC issuer whose workload-identity JWTs the Console accepts (e.g. AWS workload identity) |
 | `GF_SDK_OIDC_JWKS_URL`      | JWKS endpoint the Console uses to verify JWT signatures            |
 | `GF_SDK_OIDC_AUDIENCE`      | Audience claim a JWT must carry to be accepted                     |
 | `GF_SDK_ALLOWED_TENANTS`    | Optional — restrict which tenant ids the deployment will serve     |
 | `GF_SDK_PENDING_AGENT_MODE` | `flag` (default) or `block` — how calls from not-yet-approved agents are handled (see [Agent registration](#agent-registration)) |
 
-Configure the shared secret, the OIDC trio, or both — a call authenticates if
-either credential form verifies.
-
-### SDK-side pairing
-
-- **Shared secret** — set `G8R_API_KEY` (or pass `apiKey` / `api_key`) to the
-  value of `GF_SDK_SHARED_SECRET`.
-- **Workload identity** — supply a short-lived OIDC JWT via the SDKs'
-  credential-provider option instead of a static key; see the
-  [TypeScript](./js/README.md) and [Python](./python/README.md) READMEs for
-  the exact surface. When the Console verifies a JWT, the token's tenant claim
-  is authoritative — it overrides the `tenantId` sent in the request body, and
-  a mismatch is rejected.
-
-The Console answers `401` for a bad or missing credential and `403` for a
-tenant mismatch.
+When the Console verifies a JWT, the token's tenant claim is authoritative —
+it overrides the `tenantId` sent in the request body, and a mismatch is
+rejected. The Console answers `401` for a bad or missing credential and `403`
+for a tenant mismatch.
 
 ### Agent registration
 

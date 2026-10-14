@@ -7,7 +7,11 @@ Install:
 Run:
     AWS_REGION=us-east-1 G8R_PEP_URL=https://pep.yourcompany.com \
     G8R_CONSOLE_URL=https://shield.yourcompany.com \
-    G8R_API_KEY=sk-shield-your-key python example_bedrock.py
+    G8R_TENANT_CREDENTIAL_FILE=/run/secrets/g8r-tenant-credential \
+    python example_bedrock.py
+
+Fetch the credential file at runtime (for example `op read --out-file`).
+Do not put the credential on the command line.
 """
 
 import os
@@ -20,7 +24,7 @@ shield = AgentShield(
     tenant_id=os.environ.get("G8R_TENANT_ID", "demo-tenant"),
     pep_url=os.environ["G8R_PEP_URL"],
     console_url=os.environ["G8R_CONSOLE_URL"],
-    api_key=os.environ["G8R_API_KEY"],
+    credential_file=os.environ["G8R_TENANT_CREDENTIAL_FILE"],
     department="Legal",
     user_id="usr_LEG_001",
     employee_name="Demo User",

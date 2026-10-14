@@ -47,6 +47,8 @@ describe('credentialProvider', () => {
     jest.restoreAllMocks();
     delete process.env.G8R_CONSOLE_URL;
     delete process.env.G8R_API_KEY;
+    delete process.env.G8R_TENANT_CREDENTIAL;
+    delete process.env.G8R_TENANT_CREDENTIAL_FILE;
   });
 
   describe('construction', () => {
@@ -128,6 +130,7 @@ describe('credentialProvider', () => {
 
     it('ignores the G8R_API_KEY env fallback when a provider is configured', async () => {
       process.env.G8R_API_KEY = 'sk-from-env';
+      process.env.G8R_TENANT_CREDENTIAL = 'sk-from-env';
       mockFetchSequence([{ ok: true, body: allowedResponse }]);
       const shield = new AgentShield({
         ...providerConfig,

@@ -53,6 +53,17 @@ _RETRY_BACKOFF_SECONDS = 0.5
 
 _ENV_PEP_URL = "G8R_PEP_URL"
 _ENV_CONSOLE_URL = "G8R_CONSOLE_URL"
+# Runtime supply for ONE tenant or agent in this process. Never a deployment-wide
+# default: each client can instead be given its own file or env var name.
+_ENV_TENANT_CREDENTIAL = "G8R_TENANT_CREDENTIAL"
+_ENV_TENANT_CREDENTIAL_FILE = "G8R_TENANT_CREDENTIAL_FILE"
+
+_MISSING_CREDENTIAL = (
+    "A per-tenant credential is required. Pass api_key, credential_file, or "
+    "credential_env for this tenant or agent, or set G8R_TENANT_CREDENTIAL or "
+    "G8R_TENANT_CREDENTIAL_FILE to a credential fetched at runtime (for example "
+    "from 1Password or the broker). There is no shared or default SDK secret."
+)
 
 # wrap() hops PEP POST /decide (the SDK facade on the same gateway as /proxy).
 # /proxy forwards to a downstream URL; wrap() is decide-then-factory, so /decide
@@ -65,6 +76,44 @@ _OUTCOME_TO_DECISION = {
     "REQUIRE_APPROVAL": "escalated",
     "ERROR": "blocked",
 }
+
+
+def _nonempty(value: str | None) -> str | None:
+    """Return stripped text, or None when missing or blank."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _read_credential_file(path: str) -> str:
+    """Read a tenant/agent credential from a file. The value is never logged."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except UnicodeDecodeError:
+        raise ValueError(
+            f"credential_file {path!r} is not UTF-8 text. A per-tenant credential is required."
+        ) from None
+    except OSError as exc:
+        raise ValueError(
+            f"credential_file {path!r} could not be read ({type(exc).__name__}). "
+            "A per-tenant credential is required."
+        ) from None
+    credential = raw.strip()
+    if not credential:
+        raise ValueError(f"credential_file {path!r} is empty. A per-tenant credential is required.")
+    return credential
+
+
+def _read_credential_env(name: str) -> str:
+    """Read a tenant/agent credential from a named env var. The value is never logged."""
+    credential = (os.environ.get(name) or "").strip()
+    if not credential:
+        raise ValueError(
+            f"Environment variable {name} is unset or empty. A per-tenant credential is required."
+        )
+    return credential
 
 
 def _reject_loopback(url: str, field: str) -> str:
@@ -355,23 +404,29 @@ class AgentShield:
             the ``check()`` gap). Required in effect, but resolved from this
             argument OR the ``G8R_CONSOLE_URL`` env var; construction fails if
             neither is set. Never defaults to localhost.
-        api_key: Bearer token for the SDK check/log endpoints — the STATIC
-            credential path (deployment shared secret). Required in effect
-            unless ``credential_provider`` is supplied; resolved from this
-            argument OR the ``G8R_API_KEY`` env var; construction fails if
-            neither yields a non-empty value. Mutually exclusive with
+        api_key: This client's tenant or agent bearer credential, already
+            fetched at runtime by the caller. There is no default. Mutually
+            exclusive with ``credential_file``, ``credential_env``, and
             ``credential_provider``.
+        credential_file: Filesystem path of this client's tenant or agent
+            credential (for example a file written by 1Password or the broker).
+            Read at construction — missing or empty refuses to start — and
+            again on every request so a replaced file is picked up. The
+            contents are never logged.
+        credential_env: Name of the environment variable holding THIS client's
+            credential. The SDK does not choose a process-wide name; unset or
+            empty refuses to start. The value is never logged.
         credential_provider: Zero-argument callable returning the Bearer
-            credential — the DYNAMIC path for short-lived tokens (e.g. an
-            OIDC JWT minted via AWS workload identity). Invoked fresh for
-            EVERY request (both ``/check`` and ``/log``) so a token that
-            expires mid-session never goes stale inside a long-lived
-            AgentShield instance. Mutually exclusive with an explicit
-            ``api_key`` (``ValueError`` if both are passed); when supplied,
-            the ``G8R_API_KEY`` env var is ignored. Provider failures raise
-            ``ShieldConnectionError`` on the check path — fail closed, the
-            wrapped LLM call never executes. The returned value is never
-            logged.
+            credential — the dynamic path for short-lived per-tenant tokens
+            (for example an OIDC JWT). Invoked fresh for EVERY request (both
+            ``/check`` and ``/log``) so a token that expires mid-session never
+            goes stale. Mutually exclusive with the static sources above.
+            Provider failures raise ``ShieldConnectionError`` on the check
+            path — fail closed, the wrapped LLM call never executes. The
+            returned value is never logged. When no explicit source is passed,
+            ``G8R_TENANT_CREDENTIAL`` or ``G8R_TENANT_CREDENTIAL_FILE`` (exactly
+            one) supplies the credential for this process. Construction fails
+            if none of these yields a credential.
         department: Functional department (e.g. 'Legal', 'Finance').
         user_id: Identifier of the end-user initiating the action.
         employee_name: Human-readable name for audit trail.
@@ -397,6 +452,8 @@ class AgentShield:
         "_pep_url",
         "_console_url",
         "_api_key",
+        "_credential_file",
+        "_credential_env",
         "_credential_provider",
         "_tenant_id",
         "_department",
@@ -417,6 +474,8 @@ class AgentShield:
         pep_url: str | None = None,
         console_url: str | None = None,
         api_key: str | None = None,
+        credential_file: str | None = None,
+        credential_env: str | None = None,
         department: str = "General",
         user_id: str = "unknown",
         employee_name: str | None = None,
@@ -454,27 +513,64 @@ class AgentShield:
             )
         self._pep_url = _reject_loopback(resolved_pep, "pep_url")
 
-        if credential_provider is not None and api_key is not None:
+        explicit_key = _nonempty(api_key)
+        explicit_file = _nonempty(credential_file)
+        explicit_env = _nonempty(credential_env)
+        sources = [
+            name
+            for name, present in (
+                ("api_key", explicit_key is not None),
+                ("credential_file", explicit_file is not None),
+                ("credential_env", explicit_env is not None),
+                ("credential_provider", credential_provider is not None),
+            )
+            if present
+        ]
+        if len(sources) > 1:
             # Two explicit credential sources is a config bug, not a
             # preference to guess at. Fail fast rather than silently
-            # picking one and leaving the other dead.
+            # picking one and leaving the other dead. The message names
+            # the sources only — never a credential value.
             raise ValueError(
-                "api_key and credential_provider are mutually exclusive. "
-                "Pass the static shared secret OR a provider callable, not both."
+                "api_key, credential_file, credential_env, and credential_provider "
+                "are mutually exclusive. Pass exactly one credential source."
             )
+
         self._credential_provider = credential_provider
+        self._credential_file = None
+        self._credential_env = None
+        self._api_key = ""
         if credential_provider is not None:
-            # Dynamic path: the provider is the sole credential source. The
-            # G8R_API_KEY env var is deliberately NOT consulted — a stale
-            # secret left in the deployment environment must never shadow
-            # the short-lived tokens the caller opted into.
-            self._api_key = ""
+            # Dynamic path: the provider is the sole credential source.
+            # Process env is not consulted — a stale value left in the
+            # environment must never shadow the token the caller opted into.
+            pass
+        elif explicit_key is not None:
+            self._api_key = explicit_key
+        elif explicit_file is not None:
+            _read_credential_file(explicit_file)  # refuse to start if unusable
+            self._credential_file = explicit_file
+        elif explicit_env is not None:
+            _read_credential_env(explicit_env)
+            self._credential_env = explicit_env
         else:
-            self._api_key = api_key or os.environ.get("G8R_API_KEY") or ""
-            if not self._api_key:
+            file_env = _nonempty(os.environ.get(_ENV_TENANT_CREDENTIAL_FILE))
+            value_env = _nonempty(os.environ.get(_ENV_TENANT_CREDENTIAL))
+            if file_env and value_env:
                 raise ValueError(
-                    "G8R API key is required. Pass api_key=... or set the G8R_API_KEY env var."
+                    "G8R_TENANT_CREDENTIAL and G8R_TENANT_CREDENTIAL_FILE are both set. "
+                    "Pass one per-tenant credential source. "
+                    "There is no shared or default SDK secret."
                 )
+            if file_env:
+                _read_credential_file(file_env)
+                self._credential_file = file_env
+            elif value_env:
+                # Re-read the named variable per request; do not copy the
+                # secret onto the instance beyond the request that sends it.
+                self._credential_env = _ENV_TENANT_CREDENTIAL
+            else:
+                raise ValueError(_MISSING_CREDENTIAL)
 
         self._tenant_id = tenant_id
         self._department = department
@@ -767,33 +863,53 @@ class AgentShield:
     def _bearer_credential(self) -> str:
         """Resolve the Bearer value for ONE outbound request.
 
-        Static path: the api_key resolved at construction. Dynamic path: the
-        credential_provider is invoked fresh on every call — never cached —
-        so short-lived tokens (OIDC JWTs from AWS workload identity) stay
-        valid across a long-lived AgentShield instance.
+        Static api_key: the value stored at construction. File and env
+        sources are read fresh on every call so a broker can rotate the
+        mounted credential without restarting the process. A provider is
+        invoked fresh on every call — never cached — so short-lived tokens
+        stay valid across a long-lived AgentShield instance.
 
-        A provider failure is wrapped in :class:`ShieldConnectionError`
+        A resolution failure is wrapped in :class:`ShieldConnectionError`
         rather than surfaced raw: like a connection failure, the request
         never completed and there is no server response to carry — and on
         the check path the caller fails CLOSED (the wrapped LLM call never
-        runs) instead of proceeding unevaluated. The provider's exception is
+        runs) instead of proceeding unevaluated. The underlying exception is
         chained as ``__cause__``; its message is deliberately kept out of
-        ours, and the returned credential is never logged.
+        ours, and the credential itself is never logged.
         """
-        if self._credential_provider is None:
-            return self._api_key
         try:
-            return self._credential_provider()
+            if self._credential_provider is not None:
+                credential = self._credential_provider()
+            elif self._credential_file is not None:
+                credential = _read_credential_file(self._credential_file)
+            elif self._credential_env is not None:
+                credential = _read_credential_env(self._credential_env)
+            else:
+                credential = self._api_key
         except Exception as exc:
+            if self._credential_provider is not None:
+                message = (
+                    "[G8R Shield] credential_provider raised while resolving the "
+                    "Bearer credential; failing closed. See __cause__ for the "
+                    "underlying error."
+                )
+            else:
+                message = (
+                    "[G8R Shield] The per-tenant credential could not be read; failing closed."
+                )
+            raise ShieldConnectionError(message) from exc
+        if not isinstance(credential, str) or not credential.strip():
             raise ShieldConnectionError(
-                "[G8R Shield] credential_provider raised while resolving the "
-                "Bearer credential; failing closed. See __cause__ for the "
-                "underlying error."
-            ) from exc
+                "[G8R Shield] The per-tenant credential is empty; failing closed."
+            )
+        return credential.strip()
 
     def _prepare_receipt_request(
-        self, endpoint: str, payload: dict[str, Any],
-        headers: dict[str, str | bytes], request_id: str,
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        headers: dict[str, str | bytes],
+        request_id: str,
     ) -> dict[str, Any] | None:
         if self._receipt_verifier is None:
             return None
@@ -802,30 +918,44 @@ class AgentShield:
             for name, value in headers.items()
         }
         request = build_receipt_request(
-            endpoint=endpoint, tenant_id=self._tenant_id, agent_id=self._agent_id,
-            request_id=request_id, headers=wire_headers, body=payload,
+            endpoint=endpoint,
+            tenant_id=self._tenant_id,
+            agent_id=self._agent_id,
+            request_id=request_id,
+            headers=wire_headers,
+            body=payload,
         )
         headers["X-G8R-Receipt-Nonce"] = request["nonce"]
         headers["X-G8R-Receipt-Version"] = "1"
         return request
 
     def _verified_policy_decision(
-        self, data: Any, request: dict[str, Any], tokens: list[str],
+        self,
+        data: Any,
+        request: dict[str, Any],
+        tokens: list[str],
     ) -> PolicyDecision:
         if self._receipt_verifier is None:
             raise ReceiptVerificationError("Receipt verifier is required")
         receipt = self._receipt_verifier.verify_response(data, request)
         decision = receipt.decision
         return PolicyDecision(
-            decision=decision["decision"], reason=decision["reason"],
+            decision=decision["decision"],
+            reason=decision["reason"],
             violated_rule=decision["violatedRule"],
             requires_approval=decision["requiresApproval"],
             session_revoked=decision["sessionRevoked"],
-            compliance_mappings=[ComplianceMapping(
-                regulation=m["regulation"], control_id=m["controlId"],
-                control_name=m["controlName"], description=m["description"],
-            ) for m in decision["complianceMappings"]],
-            redacted_tokens=tokens, decision_receipt=receipt.token,
+            compliance_mappings=[
+                ComplianceMapping(
+                    regulation=m["regulation"],
+                    control_id=m["controlId"],
+                    control_name=m["controlName"],
+                    description=m["description"],
+                )
+                for m in decision["complianceMappings"]
+            ],
+            redacted_tokens=tokens,
+            decision_receipt=receipt.token,
         )
 
     def _evaluate(self, prompt: str, request_id: str | None = None) -> PolicyDecision:
@@ -879,7 +1009,10 @@ class AgentShield:
         # responses, including 401/403) are surfaced immediately — retrying
         # those is just doubling the user-visible latency.
         receipt_request = self._prepare_receipt_request(
-            "/api/sdk/v1/check", payload, headers, request_id,
+            "/api/sdk/v1/check",
+            payload,
+            headers,
+            request_id,
         )
         response = None
         last_exc: Exception | None = None
@@ -978,7 +1111,10 @@ class AgentShield:
         }
 
         receipt_request = self._prepare_receipt_request(
-            "/decide", payload, headers, request_id,
+            "/decide",
+            payload,
+            headers,
+            request_id,
         )
         response = None
         last_exc: Exception | None = None

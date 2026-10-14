@@ -53,6 +53,8 @@ describe('AgentShield', () => {
     jest.restoreAllMocks();
     delete process.env.G8R_CONSOLE_URL;
     delete process.env.G8R_API_KEY;
+    delete process.env.G8R_TENANT_CREDENTIAL;
+    delete process.env.G8R_TENANT_CREDENTIAL_FILE;
   });
 
   describe('constructor / config resolution', () => {
@@ -74,13 +76,13 @@ describe('AgentShield', () => {
 
     it('throws when apiKey is unresolvable (no arg, no env)', () => {
       expect(() => new AgentShield({ ...mockConfig, apiKey: undefined })).toThrow(
-        /apiKey is required/
+        /per-tenant credential/
       );
     });
 
     it('resolves consoleUrl and apiKey from env when omitted', async () => {
       process.env.G8R_CONSOLE_URL = 'https://env-console.example.com';
-      process.env.G8R_API_KEY = 'sk-from-env';
+      process.env.G8R_TENANT_CREDENTIAL = 'sk-from-env';
 
       const envShield = new AgentShield({
         ...mockConfig,
@@ -98,7 +100,7 @@ describe('AgentShield', () => {
 
     it('prefers explicit args over env vars', async () => {
       process.env.G8R_CONSOLE_URL = 'https://env-console.example.com';
-      process.env.G8R_API_KEY = 'sk-from-env';
+      process.env.G8R_TENANT_CREDENTIAL = 'sk-from-env';
 
       const argShield = new AgentShield(mockConfig);
       mockCheckOnly(allowedResponse);
