@@ -67,7 +67,9 @@ from .conftest import (
 
 class TestConstruction:
     def test_defaults_applied(self):
-        s = AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k")
+        s = AgentShield(
+            tenant_id="t1", pep_url=PEP_URL, console_url="https://x.example", api_key="k"
+        )
         assert s._department == "General"
         assert s._user_id == "unknown"
         assert s._ai_model == "unknown"
@@ -101,12 +103,12 @@ class TestConstruction:
         monkeypatch.delenv("G8R_TENANT_CREDENTIAL", raising=False)
         monkeypatch.delenv("G8R_TENANT_CREDENTIAL_FILE", raising=False)
         with pytest.raises(ValueError, match="per-tenant credential"):
-            AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="http://x")
+            AgentShield(tenant_id="t1", pep_url=PEP_URL, console_url="https://x.example")
 
     def test_raises_when_no_tenant_id(self):
         """Empty tenant_id must fail-fast at construction."""
         with pytest.raises(ValueError, match="tenant_id is required"):
-            AgentShield(tenant_id="", pep_url=PEP_URL, console_url="http://x", api_key="k")
+            AgentShield(tenant_id="", pep_url=PEP_URL, console_url="https://x.example", api_key="k")
 
     def test_raises_when_no_pep_url(self, monkeypatch):
         monkeypatch.delenv("G8R_PEP_URL", raising=False)
@@ -136,7 +138,11 @@ class TestConstruction:
 
     def test_timeout_accepts_float(self):
         s = AgentShield(
-            tenant_id="t1", pep_url=PEP_URL, console_url="http://x", api_key="k", timeout=2.5
+            tenant_id="t1",
+            pep_url=PEP_URL,
+            console_url="https://x.example",
+            api_key="k",
+            timeout=2.5,
         )
         assert s._timeout == 2.5
 
@@ -1093,19 +1099,25 @@ class TestCredentialProvider:
         assert len(responses.calls) == 0  # nothing reached the console
 
     def test_provider_exception_message_not_leaked(self):
-        """The provider's own message could carry token material; it lives on
-        __cause__ (opt-in), never in str(exc)."""
+        """The provider's own message could carry token material. It must not
+        be chained as __cause__ or __context__ — traceback printers emit both —
+        and it must not appear in str(exc)."""
+        import traceback
+
+        secret = "secret-jwt-material-do-not-echo"
 
         def provider() -> str:
-            raise RuntimeError("secret-jwt-material-do-not-echo")
+            raise RuntimeError(secret)
 
         s = self._provider_shield(provider)
 
         with pytest.raises(ShieldConnectionError) as exc_info:
             s.check("test", log=False)
 
-        assert "secret-jwt-material-do-not-echo" not in str(exc_info.value)
-        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert secret not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        formatted = "".join(traceback.format_exception(exc_info.value))
+        assert secret not in formatted
 
     @responses.activate
     def test_provider_failure_on_log_path_is_swallowed(self):
@@ -1241,7 +1253,7 @@ class TestCanonicalContract:
     version. If any of these drift, Python↔TypeScript parity is broken and
     this test fails loudly."""
 
-    CANONICAL_VERSION = "0.6.0"
+    CANONICAL_VERSION = "0.7.0"
 
     def test_constructor_exposes_exactly_the_canonical_fields(self):
         import inspect
@@ -1358,7 +1370,7 @@ class TestCanonicalContract:
         assert exc.detail == "secret-token-leak"  # available for opt-in inspection
 
     def test_version_is_canonical(self):
-        """Both SDKs land on the SAME 0.6.0 (lockstep) so 'are these in
+        """Both SDKs land on the SAME 0.7.0 (lockstep) so 'are these in
         parity?' is a version-equality check in CI."""
         assert g8r_shield.__version__ == self.CANONICAL_VERSION
 

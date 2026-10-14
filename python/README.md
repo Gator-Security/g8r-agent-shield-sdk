@@ -55,7 +55,7 @@ except ShieldBlockedError as err:
         print(f"  {m.regulation} {m.control_id} — {m.control_name}")
 ```
 
-`pep_url` is required (`G8R_PEP_URL`); there is no `console_url` fallback and loopback is refused. `console_url` falls back to `G8R_CONSOLE_URL`. The bearer credential is per tenant or per agent (`api_key`, `credential_file`, `credential_env`, or `G8R_TENANT_CREDENTIAL` / `G8R_TENANT_CREDENTIAL_FILE`) — there is no shared or default secret, and a missing credential raises `ValueError`. `check()` still POSTs Console `/api/sdk/v1/check` (the documented gap). `wrap()` does not.
+`pep_url` is required (`G8R_PEP_URL`); there is no `console_url` fallback. Both `pep_url` and `console_url` must be `https`. Loopback is refused unless `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for localhost, 127.0.0.1, and `[::1]`. `console_url` falls back to `G8R_CONSOLE_URL`. The bearer credential is per tenant or per agent (`api_key`, `credential_file`, `credential_env`, or `G8R_TENANT_CREDENTIAL` / `G8R_TENANT_CREDENTIAL_FILE`) — there is no shared or default secret, and a missing credential raises `ValueError`. `check()` still POSTs Console `/api/sdk/v1/check` (the documented gap). `wrap()` does not.
 
 ## How It Works
 
@@ -86,8 +86,8 @@ The factory pattern (`lambda: ...` or any zero-argument callable) ensures the LL
 
 | Parameter            | Type            | Required | Default                                     | Description                              |
 | -------------------- | --------------- | -------- | ------------------------------------------- | ---------------------------------------- |
-| `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty |
-| `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback) |
+| `tenant_id`          | `str`           | Yes      | —                                           | Tenant identifier for isolation; raises `ValueError` if empty or whitespace |
+| `console_url`        | `str`           | Yes\*    | `G8R_CONSOLE_URL` env                        | HTTPS URL of the G8R Agent Shield Console. Pass directly or set `G8R_CONSOLE_URL`; a missing value raises `ValueError` (no localhost fallback). Loopback is refused unless `G8R_ALLOW_INSECURE_LOCALHOST=1` |
 | `api_key`            | `str \| None`   | One of\* | `None`                                      | This client's tenant or agent bearer credential, already fetched at runtime. No default. Mutually exclusive with the other credential sources |
 | `credential_file`    | `str \| None`   | One of\* | `None` (or `G8R_TENANT_CREDENTIAL_FILE`)    | Path to this client's credential file (1Password or broker mount). Read at start and on every request. Contents are never logged |
 | `credential_env`     | `str \| None`   | One of\* | `None`                                      | Name of the env var holding THIS client's credential. Unset or empty refuses to start. The value is never logged |

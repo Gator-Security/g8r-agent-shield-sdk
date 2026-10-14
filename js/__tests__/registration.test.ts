@@ -15,7 +15,7 @@ import { tenantId } from '../src/ids';
 
 const mockConfig = {
   pepUrl: 'https://pep.test.example',
-  consoleUrl: 'http://localhost:3000',
+  consoleUrl: 'https://console.test.example',
   apiKey: 'sk-shield-test-key',
   tenantId: tenantId('acme-inc'),
   agentId: 'brand-new-agent',

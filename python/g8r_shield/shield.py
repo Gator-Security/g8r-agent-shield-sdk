@@ -11,6 +11,7 @@ from collections.abc import Callable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -57,6 +58,10 @@ _ENV_CONSOLE_URL = "G8R_CONSOLE_URL"
 # default: each client can instead be given its own file or env var name.
 _ENV_TENANT_CREDENTIAL = "G8R_TENANT_CREDENTIAL"
 _ENV_TENANT_CREDENTIAL_FILE = "G8R_TENANT_CREDENTIAL_FILE"
+# Local-dev only. Permits http to loopback hosts and nothing else.
+_ENV_ALLOW_INSECURE_LOCALHOST = "G8R_ALLOW_INSECURE_LOCALHOST"
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_DEV_OVERRIDE_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 _MISSING_CREDENTIAL = (
     "A per-tenant credential is required. Pass api_key, credential_file, or "
@@ -116,22 +121,45 @@ def _read_credential_env(name: str) -> str:
     return credential
 
 
+def _localhost_dev_override() -> bool:
+    """True only for an explicit localhost dev override. Anything else is off."""
+    raw = os.environ.get(_ENV_ALLOW_INSECURE_LOCALHOST)
+    if not raw:
+        return False
+    return raw.strip().lower() in _DEV_OVERRIDE_TRUTHY
+
+
 def _reject_loopback(url: str, field: str) -> str:
-    """Strip trailing slash; refuse empty and loopback targets."""
+    """Normalize a console or PEP base URL.
+
+    HTTPS is required. Loopback targets are refused so a misconfigured agent
+    cannot ship prompts to 127.0.0.1. ``G8R_ALLOW_INSECURE_LOCALHOST=1``
+    permits ``http`` only for localhost, 127.0.0.1, and ``[::1]`` (https on
+    those hosts is allowed too). It does not permit plaintext to any other host.
+    """
     cleaned = url.strip().rstrip("/")
     if not cleaned:
         raise ValueError(f"{field} is required")
-    host = cleaned.lower()
-    if (
-        "://localhost" in host
-        or "://127.0.0.1" in host
-        or "://[::1]" in host
-        or host.startswith("localhost")
-        or host.startswith("127.0.0.1")
-    ):
+    try:
+        parsed = urlsplit(cleaned)
+    except ValueError:
+        raise ValueError(f"{field} must be an https URL") from None
+    host = (parsed.hostname or "").lower()
+    loopback = host in _LOOPBACK_HOSTS
+    override = _localhost_dev_override()
+    if loopback and not override:
         raise ValueError(
             f"{field} must not target localhost. An SDK that ships prompts must "
-            "fail closed rather than silently talk to 127.0.0.1."
+            "fail closed rather than silently talk to 127.0.0.1. For local "
+            f"development set {_ENV_ALLOW_INSECURE_LOCALHOST}=1."
+        )
+    https_ok = parsed.scheme == "https" and bool(host)
+    localhost_http_ok = override and loopback and parsed.scheme == "http" and bool(host)
+    if not (https_ok or localhost_http_ok):
+        raise ValueError(
+            f"{field} must be https. A localhost-only dev override is "
+            f"{_ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for "
+            "localhost, 127.0.0.1, and [::1]."
         )
     return cleaned
 
@@ -395,15 +423,18 @@ class AgentShield:
 
     Args:
         tenant_id: The one hard-required field — identifies the tenant in the
-            multi-tenant plane. Must be a non-empty string. No env fallback:
-            tenant is call-site identity, not deployment config.
+            multi-tenant plane. Must be a non-empty, non-whitespace string.
+            No env fallback: tenant is call-site identity, not deployment config.
         pep_url: Base URL of the PEP gateway. Required: this argument OR
-            ``G8R_PEP_URL``. No ``console_url`` fallback. Loopback is refused.
+            ``G8R_PEP_URL``. No ``console_url`` fallback. Must be ``https``.
+            Loopback is refused unless ``G8R_ALLOW_INSECURE_LOCALHOST=1``,
+            which permits http only for localhost, 127.0.0.1, and ``[::1]``.
             wrap() hops ``POST {pep_url}/decide``.
         console_url: Base URL of your deployed G8R Console (audit ``/log`` and
             the ``check()`` gap). Required in effect, but resolved from this
             argument OR the ``G8R_CONSOLE_URL`` env var; construction fails if
-            neither is set. Never defaults to localhost.
+            neither is set. Same https and loopback rules as ``pep_url``.
+            Never defaults to localhost.
         api_key: This client's tenant or agent bearer credential, already
             fetched at runtime by the caller. There is no default. Mutually
             exclusive with ``credential_file``, ``credential_env``, and
@@ -423,7 +454,9 @@ class AgentShield:
             goes stale. Mutually exclusive with the static sources above.
             Provider failures raise ``ShieldConnectionError`` on the check
             path — fail closed, the wrapped LLM call never executes. The
-            returned value is never logged. When no explicit source is passed,
+            provider exception is not chained, so a token in its message
+            cannot leak through a traceback. The returned value is never
+            logged. When no explicit source is passed,
             ``G8R_TENANT_CREDENTIAL`` or ``G8R_TENANT_CREDENTIAL_FILE`` (exactly
             one) supplies the credential for this process. Construction fails
             if none of these yields a credential.
@@ -492,7 +525,7 @@ class AgentShield:
                 "g8r-shield requires 'requests'. Install it with: pip install requests"
             )
 
-        if not tenant_id:
+        if not tenant_id or not tenant_id.strip():
             raise ValueError("tenant_id is required")
 
         resolved_url = console_url or os.environ.get(_ENV_CONSOLE_URL)
@@ -503,7 +536,7 @@ class AgentShield:
                 "a misconfigured agent would silently exfiltrate to whatever happens to be bound on "
                 "127.0.0.1 in the runtime environment."
             )
-        self._console_url = resolved_url.strip().rstrip("/")
+        self._console_url = _reject_loopback(resolved_url, "console_url")
 
         resolved_pep = pep_url or os.environ.get(_ENV_PEP_URL)
         if not resolved_pep:
@@ -566,8 +599,10 @@ class AgentShield:
                 _read_credential_file(file_env)
                 self._credential_file = file_env
             elif value_env:
-                # Re-read the named variable per request; do not copy the
-                # secret onto the instance beyond the request that sends it.
+                # G8R_TENANT_CREDENTIAL is a fixed process variable, not a
+                # caller-named credential_env. Store the variable name and
+                # re-read it on every request; the secret is never copied
+                # onto the instance.
                 self._credential_env = _ENV_TENANT_CREDENTIAL
             else:
                 raise ValueError(_MISSING_CREDENTIAL)
@@ -873,9 +908,10 @@ class AgentShield:
         rather than surfaced raw: like a connection failure, the request
         never completed and there is no server response to carry — and on
         the check path the caller fails CLOSED (the wrapped LLM call never
-        runs) instead of proceeding unevaluated. The underlying exception is
-        chained as ``__cause__``; its message is deliberately kept out of
-        ours, and the credential itself is never logged.
+        runs) instead of proceeding unevaluated. A ``credential_provider``
+        exception is not chained (``from None``): its message can contain
+        the credential, and traceback printers emit ``__cause__`` and
+        ``__context__``. The credential itself is never logged.
         """
         try:
             if self._credential_provider is not None:
@@ -888,16 +924,13 @@ class AgentShield:
                 credential = self._api_key
         except Exception as exc:
             if self._credential_provider is not None:
-                message = (
+                raise ShieldConnectionError(
                     "[G8R Shield] credential_provider raised while resolving the "
-                    "Bearer credential; failing closed. See __cause__ for the "
-                    "underlying error."
-                )
-            else:
-                message = (
-                    "[G8R Shield] The per-tenant credential could not be read; failing closed."
-                )
-            raise ShieldConnectionError(message) from exc
+                    "Bearer credential; failing closed."
+                ) from None
+            raise ShieldConnectionError(
+                "[G8R Shield] The per-tenant credential could not be read; failing closed."
+            ) from exc
         if not isinstance(credential, str) or not credential.strip():
             raise ShieldConnectionError(
                 "[G8R Shield] The per-tenant credential is empty; failing closed."

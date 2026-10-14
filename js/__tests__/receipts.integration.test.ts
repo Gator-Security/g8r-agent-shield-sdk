@@ -138,5 +138,13 @@ test('undici Response.json() is accepted as a receipt envelope', async () => {
 });
 
 test('signed mode requires HTTPS', () => {
-  expect(() => new AgentShield({ ...config, pepUrl: 'http://pep.example.test' })).toThrow(ReceiptVerificationError);
+  // HTTPS is required for every client. Construction fails before receipt
+  // verification, so this is no longer a ReceiptVerificationError.
+  expect(() => new AgentShield({ ...config, pepUrl: 'http://pep.example.test' })).toThrow(/https/);
+});
+
+test('signed mode rejects a credential in the URL', () => {
+  expect(() => new AgentShield({ ...config, pepUrl: 'https://user:pass@pep.example.test' })).toThrow(
+    ReceiptVerificationError,
+  );
 });

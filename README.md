@@ -102,6 +102,20 @@ share a credential. The value is sent only as `Authorization: Bearer` and is
 never logged. See the [TypeScript](./js/README.md) and
 [Python](./python/README.md) READMEs.
 
+## Upgrading to 0.7.0
+
+0.7.0 is a breaking release. The full migration note is in
+[CHANGELOG.md](./CHANGELOG.md).
+
+- Each client needs its own runtime credential. There is no shared or default
+  secret, and the old deployment-wide variable is not read.
+- `consoleUrl` / `console_url` and `pepUrl` / `pep_url` must be `https`.
+  Loopback is refused on both. For local development only, set
+  `G8R_ALLOW_INSECURE_LOCALHOST=1` to permit `http://localhost`,
+  `http://127.0.0.1`, and `http://[::1]` (and https on those hosts). The
+  override does not allow plaintext to any other host.
+- A blank or whitespace-only tenant id is rejected.
+
 ### Console-side configuration
 
 Set these in your Console deployment's server-side environment:

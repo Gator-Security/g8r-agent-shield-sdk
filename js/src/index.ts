@@ -34,8 +34,6 @@
  *   );
  */
 
-import { readFileSync } from 'node:fs';
-
 import { match } from 'ts-pattern';
 import { newRequestId, newSessionId, type RequestId, type TenantId } from './ids';
 import { getGovernanceContext, runWithGovernanceContext } from './context';
@@ -68,7 +66,7 @@ export type { RedactionResult } from './redaction';
  * `__version__` so "are these two in parity?" is answerable by a version-equality
  * check in CI. Bump both together.
  */
-export const VERSION = '0.6.0';
+export const VERSION = '0.7.0';
 
 /**
  * User-Agent identifying this SDK (language + version) to the Console on every
@@ -90,6 +88,9 @@ const ENV_PEP_URL = 'G8R_PEP_URL';
 /** Runtime supply for ONE tenant or agent in this process. Not a shared default. */
 const ENV_TENANT_CREDENTIAL = 'G8R_TENANT_CREDENTIAL';
 const ENV_TENANT_CREDENTIAL_FILE = 'G8R_TENANT_CREDENTIAL_FILE';
+/** Local-dev only. Permits http to loopback hosts and nothing else. */
+const ENV_ALLOW_INSECURE_LOCALHOST = 'G8R_ALLOW_INSECURE_LOCALHOST';
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const PEP_DECIDE_PATH = '/decide';
 
 const MISSING_CREDENTIAL =
@@ -105,21 +106,36 @@ const OUTCOME_TO_DECISION: Record<string, PolicyCheckResult['decision']> = {
   ERROR: 'blocked',
 };
 
+function localhostDevOverride(): boolean {
+  const raw = readEnv(ENV_ALLOW_INSECURE_LOCALHOST);
+  if (!raw) return false;
+  return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
+}
+
 function rejectLoopback(url: string, field: string): string {
   const cleaned = url.trim().replace(/\/+$/, '');
   if (!cleaned) {
     throw new Error(`${field} is required`);
   }
-  const host = cleaned.toLowerCase();
-  if (
-    host.includes('://localhost') ||
-    host.includes('://127.0.0.1') ||
-    host.includes('://[::1]') ||
-    host.startsWith('localhost') ||
-    host.startsWith('127.0.0.1')
-  ) {
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    throw new Error(`${field} must be an https URL`);
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  const loopback = LOOPBACK_HOSTS.has(host);
+  const override = localhostDevOverride();
+  if (loopback && !override) {
     throw new Error(
-      `${field} must not target localhost. An SDK that ships prompts must fail closed rather than silently talk to 127.0.0.1.`
+      `${field} must not target localhost. An SDK that ships prompts must fail closed rather than silently talk to 127.0.0.1. For local development set ${ENV_ALLOW_INSECURE_LOCALHOST}=1.`
+    );
+  }
+  const httpsOk = parsed.protocol === 'https:' && host.length > 0;
+  const localhostHttpOk = override && loopback && parsed.protocol === 'http:' && host.length > 0;
+  if (!httpsOk && !localhostHttpOk) {
+    throw new Error(
+      `${field} must be https. A localhost-only dev override is ${ENV_ALLOW_INSECURE_LOCALHOST}=1, which permits http only for localhost, 127.0.0.1, and [::1].`
     );
   }
   return cleaned;
@@ -143,14 +159,17 @@ export interface ShieldConfig {
   receiptVerification?: ReceiptVerificationConfig;
   /**
    * Base URL of the PEP gateway. Required: this field OR `G8R_PEP_URL`.
-   * No consoleUrl fallback. Loopback is refused. wrap() hops POST {pepUrl}/decide.
+   * No consoleUrl fallback. Must be https. Loopback is refused unless
+   * `G8R_ALLOW_INSECURE_LOCALHOST=1`, which permits http only for localhost,
+   * 127.0.0.1, and [::1]. wrap() hops POST {pepUrl}/decide.
    */
   pepUrl?: string;
   /**
    * Base URL of the deployed G8R Console (audit /log and the check() gap).
    * Optional at the type level, but effectively required: resolved from this
    * field OR the `G8R_CONSOLE_URL` env var. If neither is present the
-   * constructor throws. Never defaults to localhost. A trailing slash is stripped.
+   * constructor throws. Must be https, with the same loopback rules as pepUrl.
+   * Never defaults to localhost. A trailing slash is stripped.
    */
   consoleUrl?: string;
   /**
@@ -187,11 +206,12 @@ export interface ShieldConfig {
    * (exactly one) supplies the credential for this process. The constructor
    * throws if none of these yields a credential. A provider rejection fails
    * CLOSED: it surfaces as ShieldConnectionError and wrap() never invokes the
-   * LLM factory. The returned credential is used only for the Authorization
-   * header and is never logged.
+   * LLM factory. The provider rejection is not attached as `cause` — its
+   * message can contain the credential. The returned credential is used only
+   * for the Authorization header and is never logged.
    */
   credentialProvider?: () => string | Promise<string>;
-  /** Tenant this SDK instance operates on behalf of. The one hard-required field. */
+  /** Tenant this SDK instance operates on behalf of. Required; blank or whitespace is rejected. */
   tenantId: TenantId;
   /** Optional: functional department for governance attribution (defaults to "General"). */
   department?: string;
@@ -326,7 +346,7 @@ export class AgentShield {
   private readonly receiptVerifier?: ReceiptVerifier;
 
   constructor(config: ShieldConfig) {
-    if (!config.tenantId) {
+    if (!config.tenantId || !String(config.tenantId).trim()) {
       throw new Error('tenantId is required');
     }
 
@@ -404,7 +424,8 @@ export class AgentShield {
 
     // Store all fields (with defaults applied) as write-once instance state.
     // The instance holds no mutable state and is safe to share across loops.
-    this.consoleUrl = resolvedUrl.replace(/\/+$/, ''); // strip trailing slash(es)
+    // consoleUrl uses the same https + loopback rules as pepUrl.
+    this.consoleUrl = rejectLoopback(resolvedUrl, 'consoleUrl');
     this.pepUrl = rejectLoopback(resolvedPep, 'pepUrl');
     this.credential = credential;
     this.credentialKind = credentialKind;
@@ -1005,9 +1026,9 @@ export class AgentShield {
       }
       return credential;
     } catch (err) {
-      // Log the failure (never the credential — there is none to leak, and
-      // the underlying error is preserved on `.cause` rather than stringified
-      // into a log line that downstream pipelines might surface).
+      // Log the failure class, never the credential and never the provider
+      // exception. A provider error can embed the token; attaching it as
+      // `cause` would print that token from console.error / inspect.
       log.error(
         this.credentialKind === 'provider'
           ? 'credential_provider_failed'
@@ -1019,7 +1040,8 @@ export class AgentShield {
           ? 'credentialProvider rejected — no request was sent to the console. ' +
             'Provider-based auth fails closed; check the credential source (e.g. the workload-identity token endpoint).'
           : 'The per-tenant credential could not be read. No request was sent.';
-      throw new ShieldConnectionError(this.consoleUrl, err, `[G8R Shield] ${detail}`);
+      const cause = this.credentialKind === 'provider' ? undefined : err;
+      throw new ShieldConnectionError(this.consoleUrl, cause, `[G8R Shield] ${detail}`);
     }
   }
 }
@@ -1098,8 +1120,9 @@ export class ShieldConsoleError extends Error {
  * Also thrown when a configured credentialProvider rejects: no request can
  * leave the process without a credential, which is the same
  * "could not complete the exchange" failure mode — the `message` override
- * names the provider so operators aren't sent chasing a healthy console, and
- * `.cause` carries the provider's rejection.
+ * names the provider so operators aren't sent chasing a healthy console.
+ * The provider rejection is not stored on `.cause`; it can contain the
+ * credential, and Node prints that chain.
  */
 export class ShieldConnectionError extends Error {
   public readonly consoleUrl: string;
@@ -1119,12 +1142,71 @@ export class ShieldConnectionError extends Error {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+const FS_UNAVAILABLE = 'ERR_FS_UNAVAILABLE';
+
+function fsUnavailable(): Error {
+  const err = new Error(
+    'credentialFile requires the Node.js filesystem. Browser and edge runtimes must pass apiKey or credentialProvider.'
+  );
+  (err as { code?: string }).code = FS_UNAVAILABLE;
+  return err;
+}
+
+function isFsUnavailable(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  if ('code' in err && (err as { code?: unknown }).code === FS_UNAVAILABLE) return true;
+  return err instanceof Error && err.message.includes('Dynamic require of');
+}
+
+/**
+ * Load `fs.readFileSync` only when a credential file is actually read.
+ *
+ * A top-level `import from 'node:fs'` is evaluated by browser and edge
+ * bundlers even when the caller uses apiKey or credentialProvider, and the
+ * bundle fails to resolve the builtin. `process.getBuiltinModule` (Node
+ * 20.16+) needs no static import. The `require` fallback is inside try/catch
+ * — the same shape as the async_hooks load in context.ts — so a bundler
+ * treats it as optional instead of failing the build. Node 18 CommonJS uses
+ * that fallback; Node 18 ESM has neither and gets the clear error.
+ */
+function nodeReadFileSync(): (path: string, options: { encoding: 'utf8' }) => string {
+  const proc = typeof process === 'undefined' ? undefined : process;
+  if (proc?.versions?.node == null) {
+    throw fsUnavailable();
+  }
+  if (typeof proc.getBuiltinModule === 'function') {
+    const fs = proc.getBuiltinModule('node:fs') as {
+      readFileSync?: (path: string, options: { encoding: 'utf8' }) => string;
+    };
+    if (typeof fs?.readFileSync === 'function') {
+      return fs.readFileSync;
+    }
+  }
+  try {
+    if (typeof require === 'function') {
+      const fs = require('node:fs') as {
+        readFileSync: (path: string, options: { encoding: 'utf8' }) => string;
+      };
+      return fs.readFileSync;
+    }
+  } catch (err) {
+    if (isFsUnavailable(err) || (err instanceof Error && err.message.includes('Dynamic require'))) {
+      throw fsUnavailable();
+    }
+    throw err;
+  }
+  throw fsUnavailable();
+}
+
 /** Read a tenant/agent credential file. The contents are never logged. */
 function readCredentialFile(path: string): string {
   let raw: string;
   try {
-    raw = readFileSync(path, { encoding: 'utf8' });
+    raw = nodeReadFileSync()(path, { encoding: 'utf8' });
   } catch (err) {
+    if (isFsUnavailable(err)) {
+      throw err instanceof Error ? err : fsUnavailable();
+    }
     const code =
       err && typeof err === 'object' && 'code' in err
         ? String((err as { code?: unknown }).code)

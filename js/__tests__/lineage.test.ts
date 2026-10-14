@@ -19,7 +19,7 @@ import { getGovernanceContext, asyncContextIsolated } from '../src/context';
 
 const baseConfig = {
   pepUrl: 'https://pep.test.example',
-  consoleUrl: 'http://localhost:3000',
+  consoleUrl: 'https://console.test.example',
   apiKey: 'sk-test',
   tenantId: tenantId('acme-inc'),
 };

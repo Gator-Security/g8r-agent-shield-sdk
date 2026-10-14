@@ -24,7 +24,7 @@ const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
  * hard-coded slugs that drift).
  */
 export function tenantId(s: string): TenantId {
-  if (!s) throw new Error('tenantId cannot be empty');
+  if (!s || !s.trim()) throw new Error('tenantId cannot be empty');
   if (!TENANT_ID_PATTERN.test(s)) {
     throw new Error(
       `tenantId must be 1-64 chars, [a-z0-9-], starting with [a-z0-9] (got ${JSON.stringify(s)})`

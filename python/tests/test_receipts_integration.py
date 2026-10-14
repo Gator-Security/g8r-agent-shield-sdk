@@ -1,4 +1,5 @@
 """Run these in the SDK checkout after installing [dev,receipts]."""
+
 from __future__ import annotations
 
 import copy
@@ -27,27 +28,55 @@ from g8r_shield.receipts import (
 )
 
 KEY = Ed25519PrivateKey.generate()
-PUBLIC = KEY.public_key().public_bytes(
-    serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo,
-).decode()
-VERIFICATION = ReceiptVerificationConfig("integration-authority", "integration-sdk", {"test": PUBLIC})
-CONFIG = dict(tenant_id="test-tenant", agent_id="test-agent", api_key="test-credential",
-              pep_url="https://pep.example.test", console_url="https://console.example.test",
-              receipt_verification=VERIFICATION)
+PUBLIC = (
+    KEY.public_key()
+    .public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    .decode()
+)
+VERIFICATION = ReceiptVerificationConfig(
+    "integration-authority", "integration-sdk", {"test": PUBLIC}
+)
+CONFIG = dict(
+    tenant_id="test-tenant",
+    agent_id="test-agent",
+    api_key="test-credential",
+    pep_url="https://pep.example.test",
+    console_url="https://console.example.test",
+    receipt_verification=VERIFICATION,
+)
 
 
 def decision(outcome="allowed"):
-    return dict(decision=outcome, reason="SDK integration test", violatedRule=None,
-                requiresApproval=outcome == "escalated", sessionRevoked=False, complianceMappings=[])
+    return dict(
+        decision=outcome,
+        reason="SDK integration test",
+        violatedRule=None,
+        requiresApproval=outcome == "escalated",
+        sessionRevoked=False,
+        complianceMappings=[],
+    )
 
 
 def sign(request, result, algorithm=ALGORITHM):
     now = int(time.time())
     header = dict(alg=algorithm, typ=RECEIPT_TYPE, kid="test")
-    claims = dict(version=1, iss=VERIFICATION.issuer, aud=VERIFICATION.audience,
-                  iat=now, exp=now + 30, jti=str(uuid.uuid4()), nonce=request["nonce"],
-                  tenantId=request["tenantId"], agentId=request["agentId"], requestId=request["requestId"],
-                  requestHash=request_hash(request), decision=result)
+    claims = dict(
+        version=1,
+        iss=VERIFICATION.issuer,
+        aud=VERIFICATION.audience,
+        iat=now,
+        exp=now + 30,
+        jti=str(uuid.uuid4()),
+        nonce=request["nonce"],
+        tenantId=request["tenantId"],
+        agentId=request["agentId"],
+        requestId=request["requestId"],
+        requestHash=request_hash(request),
+        decision=result,
+    )
     message = base64url(canonical_json(header)) + "." + base64url(canonical_json(claims))
     return message + "." + base64url(KEY.sign(message.encode("ascii")))
 
@@ -63,9 +92,13 @@ def install_transport(monkeypatch, make):
             assert headers["X-G8R-Receipt-Version"] == "1"
             assert len(headers["X-G8R-Receipt-Nonce"]) == 43
             request = build_receipt_request(
-                endpoint=endpoint, tenant_id=CONFIG["tenant_id"], agent_id=CONFIG["agent_id"],
+                endpoint=endpoint,
+                tenant_id=CONFIG["tenant_id"],
+                agent_id=CONFIG["agent_id"],
                 request_id=json["correlation_id"] if endpoint == "/decide" else json["requestId"],
-                headers=headers, body=json, nonce=headers["X-G8R-Receipt-Nonce"],
+                headers=headers,
+                body=json,
+                nonce=headers["X-G8R-Receipt-Nonce"],
             )
             seen.append(copy.deepcopy(request))
             value = make(request, len(seen))
@@ -87,10 +120,14 @@ def test_signed_allow_executes_once(monkeypatch):
 
 @pytest.mark.parametrize("outcome", ["blocked", "escalated"])
 def test_deny_and_approval_never_execute(monkeypatch, outcome):
-    install_transport(monkeypatch, lambda r, _: dict(receipt=sign(r, decision(outcome)), decision="allowed"))
+    install_transport(
+        monkeypatch, lambda r, _: dict(receipt=sign(r, decision(outcome)), decision="allowed")
+    )
     called = []
     with pytest.raises(ShieldBlockedError):
-        AgentShield(**CONFIG, block_on_escalated=False).wrap(lambda: called.append(True), "demo:allow")
+        AgentShield(**CONFIG, block_on_escalated=False).wrap(
+            lambda: called.append(True), "demo:allow"
+        )
     assert not called
 
 
@@ -101,7 +138,9 @@ def test_check_returns_verified_deny_and_receipt(monkeypatch):
     assert result.decision_receipt is not None and len(result.decision_receipt.split(".")) == 3
 
 
-@pytest.mark.parametrize("fault", ["missing", "wrong-request", "tampered", "wrong-algorithm", "contradictory-allow"])
+@pytest.mark.parametrize(
+    "fault", ["missing", "wrong-request", "tampered", "wrong-algorithm", "contradictory-allow"]
+)
 def test_invalid_receipt_never_executes(monkeypatch, fault):
     def response(request, _):
         if fault == "missing":
@@ -162,8 +201,11 @@ def test_legacy_mode_still_unsigned_and_advisory(monkeypatch):
 
     def post(url, *, json, headers, timeout):
         seen.append(headers)
-        value = (dict(decision=dict(outcome="REQUIRE_APPROVAL", explanation="legacy advisory"))
-                 if url.endswith("/decide") else dict(id="log", decision="allowed", timestamp="test"))
+        value = (
+            dict(decision=dict(outcome="REQUIRE_APPROVAL", explanation="legacy advisory"))
+            if url.endswith("/decide")
+            else dict(id="log", decision="allowed", timestamp="test")
+        )
         response = requests.Response()
         response.status_code = 200
         response._content = canonical_json(value)
@@ -177,5 +219,13 @@ def test_legacy_mode_still_unsigned_and_advisory(monkeypatch):
 
 @pytest.mark.parametrize("field", ["pep_url", "console_url"])
 def test_signed_mode_requires_https(field):
-    with pytest.raises(ReceiptVerificationError):
+    # HTTPS is required for every client, not only signed mode. Construction
+    # fails closed before receipt verification runs.
+    with pytest.raises(ValueError, match="https"):
         AgentShield(**{**CONFIG, field: "http://example.test"})
+
+
+@pytest.mark.parametrize("field", ["pep_url", "console_url"])
+def test_signed_mode_rejects_credential_in_url(field):
+    with pytest.raises(ReceiptVerificationError):
+        AgentShield(**{**CONFIG, field: "https://user:pass@example.test"})
